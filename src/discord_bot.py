@@ -40,81 +40,99 @@ class TradingBot(commands.Cog):
         self._register_slash()
     
 
-    def _heartbeat_embed(self, symbols, ranked, actionable, alerting, held, min_prob):
-        """Per-cycle report that spells out WHAT it looked at, WHERE the data and
-        the money live, and HOW it decided - silence alone is ambiguous."""
+    def _heartbeat_embed(self, symbols, ranked, actionable, alerting, held,
+                         min_prob, pnl):
+        """Plain-English hourly report: what you own, what it's worth, what to do."""
         buys = [r for r in ranked if r['signal'] == 1]
         sells = [r for r in ranked if r['signal'] == 0]
-        positions = self.budget_tracker.get_positions()
-        quiet = not alerting
+        positions = pnl['positions']
+        total_pl = pnl['unrealized']
+        realized = pnl['realized']
+        spent = pnl['cost_basis']
+        cash = self.budget_tracker.get_remaining_budget()
+        budget = self.budget_tracker.weekly_budget
         univ = os.getenv('UNIVERSE', 'default')
         univ_label = 'S&P 500' if univ.lower() == 'sp500' else univ
 
+        if total_pl > 0:
+            mood, color = "📈 UP", discord.Color.green()
+        elif total_pl < 0:
+            mood, color = "📉 DOWN", discord.Color.red()
+        else:
+            mood, color = "➖ FLAT", discord.Color.greyple()
+
         embed = discord.Embed(
-            title="⏱️ Hourly check" + (" — nothing to act on" if quiet else
-                                        f" — {len(alerting)} alert(s) below"),
-            color=discord.Color.greyple() if quiet else discord.Color.green(),
+            title=f"⏱️ Hourly Check — {datetime.now().strftime('%-I:%M %p')}",
+            color=color if positions else discord.Color.greyple(),
             timestamp=datetime.now().astimezone(),
         )
 
+        # --- money ---------------------------------------------------------
+        if positions:
+            pct = f" ({pnl['return_pct']:+.1%})" if spent else ""
+            money = (f"You started the week with **${budget:,.2f}**\n"
+                     f"You spent **${spent:,.2f}** buying {len(positions)} stock(s)\n"
+                     f"You have **${cash:,.2f}** cash left\n"
+                     f"Those stocks are worth **${pnl['market_value']:,.2f}** right now\n\n"
+                     f"**{mood} ${abs(total_pl):,.2f}{pct}**")
+            if realized:
+                money += f"\nAlready banked from past sales: **${realized:,.2f}**"
+        else:
+            money = (f"You haven't bought anything yet.\n"
+                     f"All **${cash:,.2f}** of this week's budget is still cash.")
+        embed.add_field(name="💰 YOUR MONEY", value=money, inline=False)
+
+        # --- holdings ------------------------------------------------------
+        if positions:
+            lines = []
+            for p in positions[:8]:
+                if p['pnl'] is None:
+                    lines.append(f"**{p['symbol']}** {p['shares']} share(s) — price unavailable")
+                    continue
+                arrow = "🟩 UP" if p['pnl'] > 0 else "🟥 DOWN" if p['pnl'] < 0 else "⬜ flat"
+                lines.append(
+                    f"**{p['symbol']}** {p['shares']} share(s) — paid ${p['avg_price']:,.2f}, "
+                    f"now ${p['price']:,.2f} → {arrow} **${abs(p['pnl']):,.2f}** "
+                    f"({p['pnl_pct']:+.1%})")
+            embed.add_field(name="📊 WHAT YOU OWN", value="\n".join(lines), inline=False)
+
+        # --- what to do ----------------------------------------------------
+        held_sells = [r for r in actionable if r['signal'] == 0]
+        if alerting:
+            todo = (f"**I sent you {len(alerting)} alert(s) — look just below this message.**\n"
+                    f"React ✅ to take the trade, ❌ to skip it. "
+                    f"If you ignore it for 5 minutes it cancels itself.")
+            if held_sells:
+                todo += (f"\n\n⚠️ One of them is a **SELL of something you own** — "
+                         f"the model thinks it's about to drop.")
+        elif not ranked:
+            todo = ("**Nothing to do.** Nothing looked strong enough this hour. "
+                    "That's normal — most hours are quiet.")
+        elif buys and not alerting:
+            todo = (f"**Nothing to do.** {len(buys)} stock(s) looked good but none fit "
+                    f"your ${cash:,.2f} of remaining cash.")
+        else:
+            todo = ("**Nothing to do.** The model thinks the whole market is heading "
+                    "down right now. You can't sell what you don't own, so there's "
+                    "nothing to act on.")
+            if positions:
+                todo = ("**Nothing to do.** The model is negative on the market, but "
+                        "nothing you own crossed the sell threshold. Holding is fine.")
+        todo += "\n\nWant to look yourself? Type **/scan** for a live ranking, or **/pnl** for detail."
+        embed.add_field(name="👉 WHAT TO DO", value=todo, inline=False)
+
+        # --- what it checked ------------------------------------------------
         embed.add_field(
-            name="🔍 WHAT I scanned",
-            value=(f"All **{len(symbols)} {univ_label}** stocks — US large-cap only "
-                   f"(NYSE/NASDAQ). Not the whole market: no small-caps, ETFs, "
-                   f"crypto, options or non-US exchanges."),
+            name="🔍 WHAT I CHECKED",
+            value=(f"All **{len(symbols)} {univ_label}** stocks (big US companies only), "
+                   f"using yesterday's closing prices from Yahoo Finance.\n"
+                   f"**{len(ranked)}** looked interesting: **{len(buys)} buy**, "
+                   f"**{len(sells)} sell**. I ignored **{len(sells) - len(held_sells)}** "
+                   f"sells on stocks you don't own."),
             inline=False)
 
-        embed.add_field(
-            name="📡 WHERE the data came from",
-            value=("Yahoo Finance **daily closing bars** (2y history), refreshed "
-                   "at the top of this cycle. Not live intraday quotes — prices "
-                   "are last close."),
-            inline=False)
-
-        embed.add_field(
-            name="🧮 HOW I decided",
-            value=(f"Scored every symbol with the ML model → **{len(ranked)}** cleared "
-                   f"{min_prob:.0%} confidence (**{len(buys)} buy**, **{len(sells)} sell**).\n"
-                   f"Dropped **{len(sells) - len([r for r in actionable if r['signal'] == 0])}** "
-                   f"sells on stocks you don't own → **{len(actionable)}** actionable → "
-                   f"alerting the top **{len(alerting)}**."),
-            inline=False)
-
-        if quiet:
-            if sells and not buys:
-                why = (f"Model called the market down: {len(sells)} sells, 0 buys. "
-                       f"You can't sell what you don't own"
-                       + (f" — you hold {len(positions)} position(s)." if positions
-                          else " — and you hold nothing yet.")) 
-            elif not ranked:
-                why = f"Nothing reached {min_prob:.0%} confidence."
-            else:
-                why = ("Candidates existed but none fit the budget "
-                       f"(${self.budget_tracker.get_remaining_budget():,.2f} left).")
-            embed.add_field(name="🤔 WHY no alert", value=why, inline=False)
-
-        top = (buys or sells)[:3]
-        if top:
-            embed.add_field(
-                name=("🏆 Strongest buys" if buys else "🏆 Strongest sells (can't act — you own none)"),
-                value="\n".join(
-                    f"{'🟢' if t['signal'] == 1 else '🔴'} **{t['symbol']}** "
-                    f"${t['price']:,.2f} · {t['probability']:.0%} confident"
-                    for t in top),
-                inline=False)
-
-        pos_txt = ("none — nothing bought yet" if not positions else
-                   ", ".join(f"{p['symbol']} x{p['shares']}" for p in positions[:6]))
-        embed.add_field(
-            name="💼 WHERE the money is",
-            value=(f"Holdings: **{pos_txt}**\n"
-                   f"Budget: **${self.budget_tracker.get_remaining_budget():,.2f}** left of "
-                   f"${self.budget_tracker.weekly_budget:,.2f} this week\n"
-                   f"⚠️ **Paper only** — trades are written to a local ledger. "
-                   f"No broker is connected and no real money moves."),
-            inline=False)
-
-        embed.set_footer(text="Next check in 1 hour · /scan to rank now · /pnl for P&L")
+        embed.set_footer(text="⚠️ PRACTICE MONEY — no broker is connected, no real trades happen. "
+                              "Next check in 1 hour.")
         return embed
 
     async def _symbols(self):
@@ -326,8 +344,10 @@ class TradingBot(commands.Cog):
 
         if os.getenv('HEARTBEAT', '1') not in ('0', 'false', 'no'):
             try:
+                pnl = await asyncio.to_thread(
+                    self.budget_tracker.get_pnl, self.engine.latest_price)
                 await channel.send(embed=self._heartbeat_embed(
-                    symbols, ranked, actionable, alerting, held, min_prob))
+                    symbols, ranked, actionable, alerting, held, min_prob, pnl))
             except Exception as e:
                 logger.error(f"Heartbeat send failed: {e}")
 

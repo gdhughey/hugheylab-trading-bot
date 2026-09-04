@@ -48,9 +48,17 @@ Sell signals on stocks you do not own are filtered out — there is no short sid
 | `/risk_check` | Claude risk read on open positions (optional) |
 | `/pause` · `/resume` | Stop or restart the hourly loop |
 
-Every hour it also posts a heartbeat saying what it scanned, where the data came
-from, how it decided, and why it did or didn't alert — so silence is never
-ambiguous.
+### Hourly heartbeat
+
+Every hour it posts a plain-English report, so silence is never ambiguous:
+
+- **💰 Your money** — budget, cash left, what your holdings are worth, up/down in
+  dollars and percent
+- **📊 What you own** — per position: what you paid, what it's worth now, gain/loss
+- **👉 What to do** — in plain words: react to an alert, or nothing, and why
+- **🔍 What I checked** — how many symbols, from where, how many were buys vs sells
+
+Set `HEARTBEAT=0` to turn it off.
 
 ## Install
 
