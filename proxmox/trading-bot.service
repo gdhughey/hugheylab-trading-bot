@@ -1,0 +1,28 @@
+[Unit]
+Description=Hybrid Trading Bot (ML signals + Discord approval + Claude analysis)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/opt/trading-bot/.env
+ExecStart=/opt/trading-bot/venv/bin/python /opt/trading-bot/main.py
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot
+
+# Hardening — the bot only needs its own directory and outbound network
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/trading-bot
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

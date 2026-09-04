@@ -1,0 +1,9 @@
+discord.py>=2.4.0
+anthropic>=0.69.0
+python-dotenv>=1.0.1
+yfinance>=0.2.51
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.5.0
+joblib>=1.4.0
+lxml>=5.0.0
