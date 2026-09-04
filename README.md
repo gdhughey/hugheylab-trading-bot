@@ -12,11 +12,60 @@ candidates on Discord, and records a trade only after you react ✅.
 | | |
 |---|---|
 | **Universe** | 503 S&P 500 tickers (constituents scraped from Wikipedia, cached) |
-| **Data** | Yahoo Finance daily bars, 2y history, refreshed every cycle |
+| **Data** | Multi-source chain — see below |
 | **Model** | Pooled `GradientBoostingClassifier` over 10 ratio/z-score features |
 | **Cadence** | Hourly: refresh prices → score all 503 → alert the top N |
-| **Approval** | Discord DM with ✅ / ❌ reactions, 5-minute timeout |
+| **Approval** | Discord ✅ / ❌ reactions, or `AUTO_TRADE=1` to execute and report |
 | **Ledger** | SQLite — trades, positions, realized P&L |
+
+## Data sources
+
+Two independent chains, each tried in order:
+
+**History** (`DATA_SOURCES`) — each provider only sees symbols the previous one
+missed, so rate-limited sources are spent on real gaps:
+
+| Source | Key | Notes |
+|---|---|---|
+| `yahoo` | no | Batched `yfinance`; ~9 requests for 503 symbols |
+| `yahoo_direct` | no | Yahoo chart API per symbol; recovers names `yfinance` drops mid-batch |
+| `alphavantage` | yes | Genuinely independent, but **25 requests/day** free — gap-fill only |
+| `tiingo` | yes | Independent daily bars |
+
+**Live quotes** (`QUOTE_SOURCES`) — used for mark-to-market and to detect stale
+history:
+
+| Source | Key | Notes |
+|---|---|---|
+| `finnhub` | yes | Free tier serves quotes; **historical candles return 403** |
+| `yahoo_quote` | no | Keyless fallback |
+
+Measured cross-check (2026-09-04): Finnhub live quotes agreed with stored Yahoo
+closes to within **0.06%** across AAPL/MSFT/NVDA/CRWD/GLW. A divergence over 15%
+is logged as probable stale history.
+
+Note that `yahoo` and `yahoo_direct` are the same upstream data by two code
+paths — redundancy against library bugs, not a second opinion on price. Real
+cross-validation needs a keyed source.
+
+Stooq was evaluated and rejected: it serves a JavaScript proof-of-work challenge
+and cannot be used without a browser.
+
+## Speed limits
+
+Measured on 2 cores / 1 GB:
+
+| Universe | Refresh | Scan | Minimum cycle |
+|---|---|---|---|
+| 20 symbols | 2.9s | 0.2s | **~3s** |
+| 503 symbols | 70.3s | 5.4s | **~76s** |
+
+Live quotes run ~0.13s/symbol, so one pass over 503 names is ~1.1 min.
+
+**Sub-minute trading is not possible with this model**, regardless of cycle
+speed: it trains on *daily* bars and predicts *next-day* direction, so polling
+faster just re-emits the same answer until the next close. Genuine intraday
+trading needs 1m/5m bars, an intraday-trained model, and a narrow universe.
 
 ## Honest performance note
 
@@ -46,7 +95,9 @@ Sell signals on stocks you do not own are filtered out — there is no short sid
 | `/stats` | Executed / rejected counts, approval rate, realized P&L |
 | `/daily_brief` | Claude market commentary (optional) |
 | `/risk_check` | Claude risk read on open positions (optional) |
-| `/pause` · `/resume` | Stop or restart the hourly loop |
+| `/retrain` | Refresh all sources and retrain (~4 min) |
+| `/sources` | Where market data is coming from, and last refresh counts |
+| `/pause` · `/resume` | Stop or restart the loop |
 
 ### Hourly heartbeat
 
@@ -59,6 +110,17 @@ Every hour it posts a plain-English report, so silence is never ambiguous:
 - **🔍 What I checked** — how many symbols, from where, how many were buys vs sells
 
 Set `HEARTBEAT=0` to turn it off.
+
+## Retraining manually
+
+```bash
+/opt/trading-bot/venv/bin/python /opt/trading-bot/train.py            # fetch + train
+/opt/trading-bot/venv/bin/python /opt/trading-bot/train.py --no-fetch # cached data only
+/opt/trading-bot/venv/bin/python /opt/trading-bot/train.py --scan     # also print top picks
+/opt/trading-bot/venv/bin/python /opt/trading-bot/train.py --target forward_5d
+```
+
+Or `/retrain` from Discord.
 
 ## Install
 

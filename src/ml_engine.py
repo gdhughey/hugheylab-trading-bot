@@ -21,6 +21,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
 from src.database import connect
+from src.providers import build_chain, build_quote_chain
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,9 @@ class TradingSignalEngine:
         self.model = None
         self.symbols = []
         self.last_metrics = {}
+        self.providers = build_chain()
+        self.quote_providers = build_quote_chain()
+        self.source_stats = {}
         Path(MODEL_PATH).parent.mkdir(parents=True, exist_ok=True)
         self._load_model()
 
@@ -161,57 +165,74 @@ class TradingSignalEngine:
     # --- data ------------------------------------------------------------
 
     def fetch_and_store_data(self, symbols=None) -> int:
-        """Download history and upsert into prices. Batched: a 500-ticker
-        universe is ~9 requests instead of 500."""
+        """Fill price history from the provider chain.
+
+        Each provider only sees the symbols still missing after the previous
+        one, so a rate-limited source is spent on genuine gaps rather than on
+        symbols that already resolved.
+        """
         self.symbols = list(symbols) if symbols else (self.symbols or load_universe())
+        pending = list(self.symbols)
         total = 0
+        self.source_stats = {}
 
-        for i in range(0, len(self.symbols), BATCH_SIZE):
-            chunk = self.symbols[i:i + BATCH_SIZE]
+        for provider in self.providers:
+            if not pending:
+                break
+            if not provider.provides_history:
+                continue
+            cap = provider.per_cycle_cap
+            attempt = pending[:cap] if cap else pending
             try:
-                raw = yf.download(
-                    chunk, period=LOOKBACK, interval='1d',
-                    auto_adjust=True, progress=False,
-                    group_by='ticker', threads=True,
-                )
+                frames, missing = provider.fetch(attempt, LOOKBACK)
             except Exception as e:
-                logger.error(f"batch download failed for {chunk[:3]}...: {e}")
-                continue
-            if raw is None or raw.empty:
+                logger.error(f"[{provider.name}] fetch failed: {e}")
                 continue
 
-            for symbol in chunk:
-                try:
-                    df = raw[symbol] if isinstance(raw.columns, pd.MultiIndex) else raw
-                    df = df.rename(columns=str.lower).dropna(subset=['close'])
-                    if df.empty:
-                        continue
-                    rows = [
-                        (symbol, idx.strftime('%Y-%m-%d'),
-                         float(r['open']), float(r['high']), float(r['low']),
-                         float(r['close']), float(r['volume'] or 0))
-                        for idx, r in df.iterrows()
-                    ]
-                    with self.conn:
-                        self.conn.executemany(
-                            "INSERT INTO prices (symbol, date, open, high, low, close, volume) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?) "
-                            "ON CONFLICT(symbol, date) DO UPDATE SET "
-                            "open=excluded.open, high=excluded.high, low=excluded.low, "
-                            "close=excluded.close, volume=excluded.volume",
-                            rows,
-                        )
-                    total += len(rows)
-                except KeyError:
-                    continue
-                except Exception as e:
-                    logger.warning(f"store failed for {symbol}: {e}")
-            logger.info(f"Fetched batch {i // BATCH_SIZE + 1}"
-                        f"/{(len(self.symbols) - 1) // BATCH_SIZE + 1} "
-                        f"({len(chunk)} tickers, {total} rows so far)")
+            rows_written = 0
+            for symbol, df in frames.items():
+                rows_written += self._store(symbol, df, provider.name)
+            total += rows_written
+            self.source_stats[provider.name] = {
+                'symbols': len(frames), 'rows': rows_written}
+            if frames:
+                logger.info(f"[{provider.name}] {len(frames)} symbols, {rows_written} rows")
 
-        logger.info(f"Stored {total} rows across {len(self.symbols)} symbols")
+            resolved = set(frames)
+            pending = [s for s in pending if s not in resolved]
+
+        if pending:
+            logger.warning(f"{len(pending)} symbol(s) unresolved by every source: "
+                           f"{', '.join(pending[:8])}{'...' if len(pending) > 8 else ''}")
+            self.source_stats['unresolved'] = {'symbols': len(pending), 'rows': 0}
+
+        logger.info(f"Stored {total} rows across {len(self.symbols) - len(pending)} symbols "
+                    f"via {len([p for p in self.providers if p.provides_history])} source(s)")
         return total
+
+    def _store(self, symbol, df, source):
+        """Upsert one symbol's OHLCV frame. Returns rows written."""
+        try:
+            rows = [
+                (symbol, idx.strftime('%Y-%m-%d'),
+                 float(r['open']), float(r['high']), float(r['low']),
+                 float(r['close']), float(r['volume'] or 0), source)
+                for idx, r in df.iterrows() if not pd.isna(r['close'])
+            ]
+            if not rows:
+                return 0
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT INTO prices (symbol, date, open, high, low, close, volume, source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(symbol, date) DO UPDATE SET "
+                    "open=excluded.open, high=excluded.high, low=excluded.low, "
+                    "close=excluded.close, volume=excluded.volume, source=excluded.source",
+                    rows)
+            return len(rows)
+        except Exception as e:
+            logger.warning(f"store failed for {symbol} from {source}: {e}")
+            return 0
 
     def _history(self, symbol: str) -> pd.DataFrame:
         df = pd.read_sql_query(
@@ -300,13 +321,34 @@ class TradingSignalEngine:
                     f"{min_probability:.0%} ({skipped} unscoreable)")
         return results[:limit] if limit else results
 
-    def latest_price(self, symbol: str):
-        """Most recent stored close for a symbol, or None if we have none."""
+    def stored_close(self, symbol: str):
+        """Most recent stored close, or None."""
         row = self.conn.execute(
             "SELECT close FROM prices WHERE symbol = ? ORDER BY date DESC LIMIT 1",
             (symbol,),
         ).fetchone()
         return float(row['close']) if row else None
+
+    def latest_price(self, symbol: str):
+        """Live quote if any provider can give one, else the last stored close.
+
+        A large gap between the two usually means our stored history is stale,
+        so it is logged rather than silently accepted.
+        """
+        close = self.stored_close(symbol)
+        for provider in self.quote_providers:
+            try:
+                live = provider.quote(symbol)
+            except Exception:
+                continue
+            if not live:
+                continue
+            if close and abs(live - close) / close > 0.15:
+                logger.warning(f"{symbol}: live {provider.name} quote ${live:,.2f} differs "
+                               f"{abs(live - close) / close:.1%} from stored close "
+                               f"${close:,.2f} - history may be stale")
+            return live
+        return close
 
     def get_signal(self, symbol: str):
         """Return {'symbol', 'signal', 'price', 'probability'} or None."""

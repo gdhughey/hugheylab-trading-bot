@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS prices (
     low         REAL,
     close       REAL,
     volume      REAL,
+    source      TEXT,                       -- which provider supplied this bar
     PRIMARY KEY (symbol, date)
 );
 
@@ -83,6 +84,12 @@ class Database:
             with self.conn:
                 self.conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl REAL")
             logger.info("Migrated: added trades.realized_pnl")
+
+        pcols = {r['name'] for r in self.conn.execute("PRAGMA table_info(prices)")}
+        if 'source' not in pcols:
+            with self.conn:
+                self.conn.execute("ALTER TABLE prices ADD COLUMN source TEXT")
+            logger.info("Migrated: added prices.source")
 
     def close(self):
         try:

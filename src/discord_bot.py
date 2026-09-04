@@ -193,6 +193,77 @@ class TradingBot(commands.Cog):
                                       color=discord.Color.red())
             await interaction.followup.send(embed=embed)
 
+        @tree.command(name='retrain',
+                      description='Refresh prices from all sources and retrain (~4 min)')
+        @app_commands.describe(fetch='Also re-download prices (default yes)')
+        async def _retrain(interaction: discord.Interaction, fetch: bool = True):
+            await interaction.response.defer(thinking=True)
+            if self.warming_up:
+                await interaction.followup.send(embed=self._warming_embed())
+                return
+            await interaction.followup.send(
+                "🔄 Refreshing data and retraining — this takes about 4 minutes. "
+                "I'll post the result here when it's done.")
+            try:
+                self.warming_up = True
+                if fetch:
+                    await asyncio.to_thread(
+                        self.engine.fetch_and_store_data, await self._symbols())
+                ok = await asyncio.to_thread(self.engine.train_model)
+                m = self.engine.last_metrics
+                if ok and m:
+                    embed = discord.Embed(
+                        title="✅ Retrained",
+                        color=discord.Color.green(),
+                        description=(f"Target **{m['mode']}** on **{m['rows']:,}** rows\n"
+                                     f"Accuracy **{m['accuracy']:.3f}** vs baseline "
+                                     f"**{m['baseline']:.3f}** → edge **{m['edge']:+.3f}**"))
+                    if m['edge'] <= 0.005:
+                        embed.add_field(
+                            name="⚠️ Reality check",
+                            value=("An edge at or below 0.005 is indistinguishable from "
+                                   "noise. Treat signals as a shortlist, not a prediction."),
+                            inline=False)
+                    src = ", ".join(f"{k}: {v['symbols']}"
+                                    for k, v in self.engine.source_stats.items()) or "cached"
+                    embed.add_field(name="Data sources", value=src, inline=False)
+                else:
+                    embed = discord.Embed(title="❌ Training failed",
+                                          description="Not enough usable data.",
+                                          color=discord.Color.red())
+            except Exception as e:
+                logger.exception("/retrain failed")
+                embed = discord.Embed(title="❌ /retrain failed", description=str(e),
+                                      color=discord.Color.red())
+            finally:
+                self.warming_up = False
+            await interaction.followup.send(embed=embed)
+
+        @tree.command(name='sources', description='Show where market data is coming from')
+        async def _sources(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            e = discord.Embed(title="📡 Market data sources", color=discord.Color.blurple())
+            hist = [p.name for p in self.engine.providers if p.provides_history]
+            quotes = [p.name for p in self.engine.quote_providers]
+            e.add_field(name="Price history (in order)",
+                        value=" → ".join(hist) or "none", inline=False)
+            e.add_field(name="Live quotes (in order)",
+                        value=" → ".join(quotes) or "none — using last stored close",
+                        inline=False)
+            if self.engine.source_stats:
+                e.add_field(
+                    name="Last refresh",
+                    value="\n".join(f"**{k}**: {v['symbols']} symbols, {v['rows']:,} rows"
+                                     for k, v in self.engine.source_stats.items()),
+                    inline=False)
+            e.add_field(
+                name="How the chain works",
+                value=("Each source only sees the symbols the previous one missed, so a "
+                       "rate-limited source is spent on real gaps. Live quotes are also "
+                       "cross-checked against stored closes — a big gap means stale history."),
+                inline=False)
+            await interaction.followup.send(embed=e)
+
         @tree.command(name='budget', description='Check or set the weekly budget')
         @app_commands.describe(amount='New weekly budget in dollars (omit to just check)')
         async def _budget(interaction: discord.Interaction, amount: float = None):
@@ -205,7 +276,7 @@ class TradingBot(commands.Cog):
                                       color=discord.Color.red())
             await interaction.followup.send(embed=embed)
 
-        logger.info("Registered 9 slash commands")
+        logger.info("Registered 11 slash commands")
 
     async def on_ready(self):
         """Bot startup event"""
@@ -294,7 +365,7 @@ class TradingBot(commands.Cog):
             logger.error(f"❌ Could not open DM with USER_ID: {e}")
         return None
 
-    @tasks.loop(hours=1)
+    @tasks.loop(minutes=float(os.getenv('CHECK_INTERVAL_MINUTES', 60)))
     async def monitor_trading(self):
         """Continuous monitoring loop"""
         channel = await self._destination()
@@ -404,8 +475,37 @@ class TradingBot(commands.Cog):
             await channel.send(embed=embed)
             return
         
-        # Log pending trade
-        trade_id = self.budget_tracker.log_trade(symbol, 'BUY' if signal['signal'] == 1 else 'SELL', price, shares)
+        side = 'BUY' if signal['signal'] == 1 else 'SELL'
+        trade_id = self.budget_tracker.log_trade(symbol, side, price, shares)
+
+        # AUTO_TRADE: execute straight away and report, rather than waiting on a
+        # reaction. Still paper - this writes to the ledger, not to a broker.
+        if os.getenv('AUTO_TRADE', '0') in ('1', 'true', 'yes'):
+            self.budget_tracker.execute_trade(trade_id)
+            done = discord.Embed(
+                title=f"{'🟢 BOUGHT' if side == 'BUY' else '🔴 SOLD'} "
+                      f"{shares} {symbol} @ ${price:,.2f}",
+                description=f"Automatic — no approval needed. Cost ${trade_amount:,.2f}.",
+                color=discord.Color.green() if side == 'BUY' else discord.Color.red(),
+                timestamp=datetime.now().astimezone(),
+            )
+            done.add_field(name="Confidence", value=f"{prob:.1%}", inline=True)
+            done.add_field(name="Cash left",
+                           value=f"${self.budget_tracker.get_remaining_budget():,.2f}",
+                           inline=True)
+            pos = next((p for p in self.budget_tracker.get_positions()
+                        if p['symbol'] == symbol), None)
+            if pos:
+                done.add_field(name="You now hold",
+                               value=f"{pos['shares']} @ avg ${pos['avg_price']:,.2f}",
+                               inline=True)
+            done.set_footer(text="AUTO MODE · PAPER TRADING — no broker, no real money")
+            try:
+                await channel.send(embed=done)
+            except Exception as e:
+                logger.error(f"Auto-trade report failed for {symbol}: {e}")
+            logger.info(f"AUTO {side} {shares} {symbol} @ ${price:.2f} (trade #{trade_id})")
+            return
         
         # Create alert embed
         embed = discord.Embed(
