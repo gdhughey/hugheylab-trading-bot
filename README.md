@@ -62,10 +62,46 @@ Measured on 2 cores / 1 GB:
 
 Live quotes run ~0.13s/symbol, so one pass over 503 names is ~1.1 min.
 
-**Sub-minute trading is not possible with this model**, regardless of cycle
-speed: it trains on *daily* bars and predicts *next-day* direction, so polling
-faster just re-emits the same answer until the next close. Genuine intraday
-trading needs 1m/5m bars, an intraday-trained model, and a narrow universe.
+The *daily* model cannot trade faster than daily, regardless of cycle speed —
+it predicts next-day direction, so polling faster re-emits the same answer until
+the next close. That is what the intraday engine below exists for.
+
+## Intraday mode (`FAST_MODE=1`)
+
+A second engine trained on **5-minute bars** over 60 days, predicting whether a
+name moves more than **0.15% within 30 minutes** — a question whose answer
+actually changes during the session.
+
+**It has roughly double the edge of the daily model:**
+
+| Model | Accuracy | Baseline | Edge |
+|---|---|---|---|
+| Daily (next-day direction) | 0.523 | 0.510 | **+0.013** |
+| Intraday (5m, 30-min horizon) | 0.699 | 0.671 | **+0.029** |
+
+Trained on 111,666 rows across 30 liquid names; a full refresh takes ~6s, so a
+60-second loop is comfortable.
+
+**Threshold calibration matters.** Only ~36% of intraday bars are positive, so
+the model's probabilities cluster near that base rate and a fixed 0.55 bar is
+*never* cleared. The selection bar is therefore relative:
+`p > base_rate x INTRADAY_PROB_RATIO` (default 1.15 → about 0.416).
+
+**Exit rules** — an intraday entry without an exit is just buy-and-hold with
+extra steps. Each cycle exits *before* entering, so a stop-loss is never delayed
+and freed capital is reusable in the same pass:
+
+| Rule | Default |
+|---|---|
+| Take profit | +1.5% |
+| Stop loss | −1.0% |
+| End-of-day flatten | 10 min before the bell |
+| Max hold | 120 min |
+| Re-entry cooldown | 15 min |
+| Max concurrent positions | 3 |
+
+Trading only happens during the regular session (09:30–16:00 ET, weekdays);
+outside those hours the loop reports and does nothing.
 
 ## Honest performance note
 
@@ -96,6 +132,7 @@ Sell signals on stocks you do not own are filtered out — there is no short sid
 | `/daily_brief` | Claude market commentary (optional) |
 | `/risk_check` | Claude risk read on open positions (optional) |
 | `/retrain` | Refresh all sources and retrain (~4 min) |
+| `/fast` | Intraday model stats, exit rules, and live scores |
 | `/sources` | Where market data is coming from, and last refresh counts |
 | `/pause` · `/resume` | Stop or restart the loop |
 

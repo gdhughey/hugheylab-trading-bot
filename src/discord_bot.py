@@ -14,6 +14,8 @@ import logging
 from src.claude_analyzer import ClaudeAnalyzer
 from src.budget_tracker import BudgetTracker
 from src.ml_engine import load_universe
+from src.intraday_engine import IntradayEngine, market_state, minutes_to_close
+from src.fast_trader import FastTrader
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,14 @@ class TradingBot(commands.Cog):
         # True while the startup fetch/train is still running, so commands can
         # say "warming up" instead of failing on a model that doesn't exist yet.
         self.warming_up = False
+
+        # Intraday fast-trading stack (only started when FAST_MODE=1)
+        self.fast_mode = os.getenv('FAST_MODE', '0') in ('1', 'true', 'yes')
+        self.intraday = IntradayEngine() if self.fast_mode else None
+        self.fast = (FastTrader(self.intraday, self.budget_tracker,
+                                quote_fn=lambda s: self.engine.latest_price(s))
+                     if self.fast_mode else None)
+        self._last_fast_summary = None
         
         # Add cogs
         self.bot.add_listener(self.on_ready)
@@ -239,6 +249,57 @@ class TradingBot(commands.Cog):
                 self.warming_up = False
             await interaction.followup.send(embed=embed)
 
+        @tree.command(name='fast', description='Intraday auto-trading status')
+        async def _fast(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            if not self.fast_mode or not self.intraday:
+                await interaction.followup.send(embed=discord.Embed(
+                    title="Fast mode is off",
+                    description="Set `FAST_MODE=1` in .env and restart to enable "
+                                "intraday auto-trading.",
+                    color=discord.Color.greyple()))
+                return
+            state, desc = market_state()
+            m = self.intraday.last_metrics or {}
+            e = discord.Embed(
+                title=f"⚡ Intraday mode — market is {desc}",
+                color=discord.Color.gold() if state == 'open' else discord.Color.greyple())
+            e.add_field(
+                name="Model",
+                value=(f"{m.get('interval', '?')} bars, predicting a "
+                       f">{m.get('threshold', 0):.2%} move within "
+                       f"{m.get('horizon_bars', 0)} bars\n"
+                       f"Accuracy **{m.get('accuracy', 0):.3f}** vs baseline "
+                       f"**{m.get('baseline', 0):.3f}** → edge **{m.get('edge', 0):+.3f}**\n"
+                       f"Trained on {m.get('rows', 0):,} rows"),
+                inline=False)
+            e.add_field(
+                name="Rules",
+                value=(f"Poll every **{os.getenv('FAST_POLL_SECONDS', 60)}s** · "
+                       f"max **{self.fast.max_positions}** positions\n"
+                       f"Take profit **+{self.fast.take_profit:.1%}** · "
+                       f"stop loss **−{self.fast.stop_loss:.1%}**\n"
+                       f"Flatten **{self.fast.eod_flatten_min:.0f} min** before the close · "
+                       f"max hold **{self.fast.max_hold_min:.0f} min**\n"
+                       f"Re-entry cooldown **{self.fast.cooldown_min:.0f} min**"),
+                inline=False)
+            ranked = await asyncio.to_thread(self.intraday.scan_all)
+            bar = self.intraday.threshold()
+            e.add_field(
+                name=f"Right now (bar p > {bar:.3f})",
+                value=("\n".join(
+                    f"{'✅' if r['above_bar'] else '▫️'} **{r['symbol']}** "
+                    f"{r['probability']:.1%} · ${r['price']:,.2f}" for r in ranked[:8])
+                    or "no scores yet"),
+                inline=False)
+            pos = self.budget_tracker.get_positions()
+            e.add_field(name="Open positions",
+                        value=("\n".join(f"**{p['symbol']}** x{p['shares']} @ "
+                                          f"${p['avg_price']:,.2f}" for p in pos)
+                               if pos else "none"), inline=False)
+            e.set_footer(text="PAPER TRADING — no broker connected")
+            await interaction.followup.send(embed=e)
+
         @tree.command(name='sources', description='Show where market data is coming from')
         async def _sources(interaction: discord.Interaction):
             await interaction.response.defer(thinking=True)
@@ -276,7 +337,7 @@ class TradingBot(commands.Cog):
                                       color=discord.Color.red())
             await interaction.followup.send(embed=embed)
 
-        logger.info("Registered 11 slash commands")
+        logger.info("Registered 12 slash commands")
 
     async def on_ready(self):
         """Bot startup event"""
@@ -331,6 +392,22 @@ class TradingBot(commands.Cog):
                     self.monitor_trading.start()
             else:
                 logger.error("❌ Model training failed")
+            if self.fast_mode:
+                logger.info("⚡ FAST MODE - preparing intraday model...")
+                await asyncio.to_thread(self.intraday.fetch)
+                if await asyncio.to_thread(self.intraday.train):
+                    m = self.intraday.last_metrics
+                    logger.info(f"⚡ Intraday model ready: accuracy "
+                                f"{m['accuracy']:.3f} vs baseline {m['baseline']:.3f} "
+                                f"(edge {m['edge']:+.3f}), bar p>{self.intraday.threshold():.3f}")
+                    if not self.fast_cycle.is_running():
+                        self.fast_cycle.start()
+                    state, desc = market_state()
+                    logger.info(f"⚡ Fast loop started every "
+                                f"{os.getenv('FAST_POLL_SECONDS', 60)}s - market is {desc}")
+                else:
+                    logger.error("⚡ Intraday training failed - fast mode disabled")
+                    self.fast_mode = False
         finally:
             self.warming_up = False
             logger.info("🟢 Ready - slash commands are live")
@@ -364,6 +441,97 @@ class TradingBot(commands.Cog):
         except Exception as e:
             logger.error(f"❌ Could not open DM with USER_ID: {e}")
         return None
+
+    @tasks.loop(seconds=float(os.getenv('FAST_POLL_SECONDS', 60)))
+    async def fast_cycle(self):
+        """Intraday entries and exits. Reports only when something happened, or
+        every FAST_SUMMARY_MINUTES, so a 60s loop doesn't spam the channel."""
+        if self.warming_up or not self.fast:
+            return
+        channel = await self._destination()
+        if not channel:
+            return
+        try:
+            summary = await asyncio.to_thread(self.fast.cycle)
+        except Exception as e:
+            logger.exception("fast cycle failed")
+            return
+
+        acted = summary['entries'] or summary['exits']
+        gap = float(os.getenv('FAST_SUMMARY_MINUTES', 30))
+        due = (self._last_fast_summary is None or
+               (datetime.now() - self._last_fast_summary).total_seconds() / 60 >= gap)
+
+        if acted:
+            try:
+                await channel.send(embed=self._fast_action_embed(summary))
+            except Exception as e:
+                logger.error(f"fast action report failed: {e}")
+        elif due and summary['state'] == 'open':
+            try:
+                await channel.send(embed=self._fast_idle_embed(summary))
+                self._last_fast_summary = datetime.now()
+            except Exception as e:
+                logger.error(f"fast summary failed: {e}")
+
+    def _fast_action_embed(self, s):
+        e = discord.Embed(
+            title="⚡ Intraday activity",
+            color=discord.Color.gold(),
+            timestamp=datetime.now().astimezone())
+        for x in s['exits']:
+            verdict = "🟩 profit" if x['pnl'] > 0 else "🟥 loss" if x['pnl'] < 0 else "flat"
+            e.add_field(
+                name=f"SOLD {x['shares']} {x['symbol']} @ ${x['price']:,.2f}",
+                value=(f"Why: {x['reason']}\n"
+                       f"Result: **${x['pnl']:+,.2f}** ({x['pct']:+.2%}) — {verdict}"),
+                inline=False)
+        for x in s['entries']:
+            e.add_field(
+                name=f"BOUGHT {x['shares']} {x['symbol']} @ ${x['price']:,.2f}",
+                value=(f"Cost ${x['cost']:,.2f} · model confidence "
+                       f"{x['probability']:.1%} (bar {s.get('bar', 0):.3f})\n"
+                       f"Will sell on +{self.fast.take_profit:.1%}, "
+                       f"−{self.fast.stop_loss:.1%}, or before the close."),
+                inline=False)
+        e.add_field(name="Cash left",
+                    value=f"${self.budget_tracker.get_remaining_budget():,.2f}",
+                    inline=True)
+        e.add_field(name="Minutes to close",
+                    value=f"{s.get('minutes_to_close', 0):.0f}", inline=True)
+        e.set_footer(text="AUTO INTRADAY · PAPER TRADING — no broker, no real money")
+        return e
+
+    def _fast_idle_embed(self, s):
+        positions = self.budget_tracker.get_positions()
+        e = discord.Embed(
+            title="⚡ Intraday check — no trades",
+            color=discord.Color.greyple(),
+            timestamp=datetime.now().astimezone())
+        cands = s.get('candidates') or []
+        e.add_field(
+            name="What I looked at",
+            value=(f"{len(self.intraday.symbols)} liquid names on "
+                   f"{self.intraday.__class__.__module__.split('.')[-1]} "
+                   f"{os.getenv('INTRADAY_INTERVAL', '5m')} bars.\n"
+                   f"Selection bar: **p > {s.get('bar', 0):.3f}**. "
+                   f"{len(cands)} cleared it."),
+            inline=False)
+        if cands:
+            e.add_field(name="Closest candidates",
+                        value="\n".join(f"**{c['symbol']}** {c['probability']:.1%} "
+                                         f"· ${c['price']:,.2f}" for c in cands[:3]),
+                        inline=False)
+        e.add_field(
+            name="Open positions",
+            value=("\n".join(f"**{p['symbol']}** x{p['shares']} @ ${p['avg_price']:,.2f}"
+                              for p in positions) if positions else "none"),
+            inline=False)
+        if s.get('note'):
+            e.add_field(name="Note", value=s['note'], inline=False)
+        e.set_footer(text=f"{s.get('minutes_to_close', 0):.0f} min to close · "
+                          f"PAPER TRADING")
+        return e
 
     @tasks.loop(minutes=float(os.getenv('CHECK_INTERVAL_MINUTES', 60)))
     async def monitor_trading(self):
@@ -411,7 +579,10 @@ class TradingBot(commands.Cog):
         if dropped:
             logger.info(f"Filtered {dropped} SELL signal(s) on unheld symbols")
 
-        alerting = actionable[:max_alerts]
+        alerting = [] if self.fast_mode else actionable[:max_alerts]
+        if self.fast_mode and actionable:
+            logger.info(f"Daily loop is report-only in FAST_MODE "
+                        f"({len(actionable)} daily signals not traded)")
 
         if os.getenv('HEARTBEAT', '1') not in ('0', 'false', 'no'):
             try:
