@@ -139,10 +139,58 @@ weekdays). **Crypto (`TRADE_CRYPTO=1`) trades 24/7** — it produces ~3.7× the 
 per calendar day, is tradeable when the stock market is shut, and is exempt from
 the end-of-day flatten since there is no close to flatten into.
 
-**Known limitation:** stocks and crypto currently share one pooled model. On the
-combined universe precision is 47.9% (EV +0.122%/trade over 20,184 held-out
-signals); trained separately the sweep showed 90.0% for stocks and 72.9% for
-crypto. Separate per-asset-class models are the obvious next improvement.
+### Separate models per asset class
+
+Stocks and crypto get their own model, their own selection bar, and their own
+barriers — they have different volatility regimes, and one pooled model served
+neither. Measured on the same data:
+
+| | Precision | Break-even | EV/trade |
+|---|---|---|---|
+| Pooled (both classes, one model) | 47.9% | 38.5% | +0.122% |
+| **Stock model** (79 symbols, 289k rows) | **92.6%** | 36.8% | **+1.059%** |
+| **Crypto model** (13 coins, 172k rows) | **66.0%** | 38.5% | **+0.358%** |
+
+The pooled number was an average hiding a strong stock model and a weak crypto
+one. Symbols are ranked by *margin over their own class bar*, since raw
+probabilities are not comparable across models with different base rates.
+
+**A class whose measured EV is negative is not traded at all** — `/fast` shows
+it as blocked. Exits still run on a blocked class, so an open position is never
+stranded.
+
+### Tuning (`tune.py`)
+
+"Train it more" is not how this improves; extra iterations on the same data
+memorise noise. `tune.py` instead trains many honest configurations and keeps
+the one that wins out of sample:
+
+```bash
+./venv/bin/python tune.py --wide      # 80 stocks + 13 coins, 36 configs each
+```
+
+Every candidate is scored on held-out EV with a purged, embargoed split, and any
+config with fewer than 300 test signals is rejected — 100% precision on 40
+signals is overfitting wearing a nice suit. Winners are written to
+`data/tuned.json` and picked up automatically on the next train.
+
+The 2026-09-08 sweep moved stocks from +0.278% to **+1.059%** EV/trade. Two
+things drove it: shallower, more heavily regularised trees (`max_depth=3`,
+`l2=2.0` beat every deeper config — the deep ones were overfitting), and a wider
+universe (80 symbols → 289k rows vs 30 symbols → 112k). Since 5m history is
+capped at 60 days, breadth is the only way to add data.
+
+**Caveat worth keeping in mind:** 92.6% precision is measured on a single 60-day
+window at a high selection bar. Walk-forward validation across several windows
+is the real test, and is not yet implemented.
+
+### Budget accounting
+
+`BUDGET_MODE=deployed` (default) caps **capital at risk** — the cost basis of
+open positions — and selling frees it again. The original `cumulative` mode
+capped total buy volume for the week and never refunded it, which halts a
+day-trading loop after a handful of round trips: recycling the same $100 ten
+times "spends" $1,000 against a $500 cap despite never risking more than $100.
 
 ## Honest performance note
 
@@ -174,6 +222,7 @@ Sell signals on stocks you do not own are filtered out — there is no short sid
 | `/risk_check` | Claude risk read on open positions (optional) |
 | `/retrain` | Refresh all sources and retrain (~4 min) |
 | `/fast` | Intraday model stats, exit rules, and live scores |
+| `/summary` | Today's results and tomorrow's game plan |
 | `/sources` | Where market data is coming from, and last refresh counts |
 | `/pause` · `/resume` | Stop or restart the loop |
 
@@ -188,6 +237,13 @@ Every hour it posts a plain-English report, so silence is never ambiguous:
 - **🔍 What I checked** — how many symbols, from where, how many were buys vs sells
 
 Set `HEARTBEAT=0` to turn it off.
+
+### Daily wrap
+
+After the close it posts one summary: what was booked today, every position
+closed, anything held overnight (crypto only — stocks are flattened), and a game
+plan for tomorrow with each model's EV, available budget, and when trading
+resumes. `/summary` runs it on demand.
 
 ## Retraining manually
 

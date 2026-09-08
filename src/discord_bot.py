@@ -9,12 +9,14 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import os
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, time as dtime
 import logging
 from src.claude_analyzer import ClaudeAnalyzer
 from src.budget_tracker import BudgetTracker
 from src.ml_engine import load_universe
-from src.intraday_engine import IntradayEngine, market_state, minutes_to_close
+from src.intraday_engine import (IntradayEngine, market_state,
+                                 minutes_to_close, ET, is_crypto,
+                                 asset_class, barriers)
 from src.fast_trader import FastTrader
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ class TradingBot(commands.Cog):
                                 quote_fn=lambda s: self.engine.latest_price(s))
                      if self.fast_mode else None)
         self._last_fast_summary = None
+        self._last_daily_summary = None
         
         # Add cogs
         self.bot.add_listener(self.on_ready)
@@ -264,20 +267,24 @@ class TradingBot(commands.Cog):
             e = discord.Embed(
                 title=f"⚡ Intraday mode — market is {desc}",
                 color=discord.Color.gold() if state == 'open' else discord.Color.greyple())
-            ev = m.get('ev', 0)
-            e.add_field(
-                name="Model",
-                value=(f"{m.get('interval', '?')} bars · target **+{m.get('take_profit', 0):.2%}** "
-                       f"before **−{m.get('stop_loss', 0):.2%}** within "
-                       f"{m.get('horizon_bars', 0)} bars "
-                       f"({m.get('horizon_bars', 0) * 5} min)\n"
-                       f"Precision **{m.get('precision', 0):.1%}** vs break-even "
-                       f"**{m.get('breakeven', 0):.1%}** on {m.get('test_signals', 0):,} "
-                       f"held-out signals\n"
-                       f"**Expected value {ev * 100:+.3f}% per trade** "
-                       f"{'✅' if ev > 0 else '⚠️ NEGATIVE — this loses money'}\n"
-                       f"Trained on {m.get('rows', 0):,} rows"),
-                inline=False)
+            metrics = self.intraday.metrics or {}
+            for cls, mm in sorted(metrics.items()):
+                ev = mm.get('ev', 0)
+                ok = "✅ profitable" if ev > 0 else "⛔ NEGATIVE — not trading this"
+                e.add_field(
+                    name=f"{'🪙' if cls == 'crypto' else '📈'} {cls.title()} model "
+                         f"({mm.get('symbols', 0)} symbols)",
+                    value=(f"Target **+{mm.get('take_profit', 0):.2%}** before "
+                           f"**−{mm.get('stop_loss', 0):.2%}** within "
+                           f"{mm.get('horizon_bars', 0) * 5} min\n"
+                           f"Precision **{mm.get('precision', 0):.1%}** vs break-even "
+                           f"**{mm.get('breakeven', 0):.1%}** "
+                           f"({mm.get('test_signals', 0):,} held-out signals)\n"
+                           f"**EV {ev * 100:+.3f}% per trade** — {ok}\n"
+                           f"Bar p>{mm.get('bar', 0):.3f} · {mm.get('rows', 0):,} rows"),
+                    inline=False)
+            if not metrics:
+                e.add_field(name="Model", value="not trained yet", inline=False)
             e.add_field(
                 name="Rules",
                 value=(f"Poll every **{os.getenv('FAST_POLL_SECONDS', 60)}s** · "
@@ -289,13 +296,14 @@ class TradingBot(commands.Cog):
                        f"Re-entry cooldown **{self.fast.cooldown_min:.0f} min**"),
                 inline=False)
             ranked = await asyncio.to_thread(self.intraday.scan_all)
-            bar = self.intraday.threshold()
             e.add_field(
-                name=f"Right now (bar p > {bar:.3f})",
+                name="Right now (each scored against its own class bar)",
                 value=("\n".join(
-                    f"{'✅' if r['above_bar'] else '▫️'} **{r['symbol']}** "
-                    f"{r['probability']:.1%} · ${r['price']:,.2f}" for r in ranked[:8])
-                    or "no scores yet"),
+                    f"{'✅' if r['above_bar'] else '▫️'} "
+                    f"{'🪙' if r['asset_class'] == 'crypto' else '📈'} "
+                    f"**{r['symbol']}** {r['probability']:.1%} "
+                    f"(bar {r['bar']:.3f}, {r['margin']:+.3f}) · ${r['price']:,.2f}"
+                    for r in ranked[:8]) or "no scores yet"),
                 inline=False)
             pos = self.budget_tracker.get_positions()
             e.add_field(name="Open positions",
@@ -304,6 +312,13 @@ class TradingBot(commands.Cog):
                                if pos else "none"), inline=False)
             e.set_footer(text="PAPER TRADING — no broker connected")
             await interaction.followup.send(embed=e)
+
+        @tree.command(name='summary', description="Today's results and tomorrow's plan")
+        async def _summary(interaction: discord.Interaction):
+            await interaction.response.defer(thinking=True)
+            embed = await asyncio.to_thread(
+                self._daily_summary_embed, datetime.now(ET).date())
+            await interaction.followup.send(embed=embed)
 
         @tree.command(name='sources', description='Show where market data is coming from')
         async def _sources(interaction: discord.Interaction):
@@ -342,7 +357,7 @@ class TradingBot(commands.Cog):
                                       color=discord.Color.red())
             await interaction.followup.send(embed=embed)
 
-        logger.info("Registered 12 slash commands")
+        logger.info("Registered 13 slash commands")
 
     async def on_ready(self):
         """Bot startup event"""
@@ -401,12 +416,16 @@ class TradingBot(commands.Cog):
                 logger.info("⚡ FAST MODE - preparing intraday model...")
                 await asyncio.to_thread(self.intraday.fetch)
                 if await asyncio.to_thread(self.intraday.train):
-                    m = self.intraday.last_metrics
-                    logger.info(f"⚡ Intraday model ready: accuracy "
-                                f"{m['accuracy']:.3f} vs baseline {m['baseline']:.3f} "
-                                f"(edge {m['edge']:+.3f}), bar p>{self.intraday.threshold():.3f}")
+                    for cls, m in sorted((self.intraday.metrics or {}).items()):
+                        verdict = "tradeable" if m['ev'] > 0 else "NEGATIVE EV - will not trade"
+                        logger.info(f"⚡ {cls} model ready: precision "
+                                    f"{m['precision']:.1%} vs breakeven "
+                                    f"{m['breakeven']:.1%}, EV {m['ev'] * 100:+.3f}%/trade "
+                                    f"({verdict}), bar p>{m['bar']:.3f}")
                     if not self.fast_cycle.is_running():
                         self.fast_cycle.start()
+                    if not self.daily_summary.is_running():
+                        self.daily_summary.start()
                     state, desc = market_state()
                     logger.info(f"⚡ Fast loop started every "
                                 f"{os.getenv('FAST_POLL_SECONDS', 60)}s - market is {desc}")
@@ -446,6 +465,119 @@ class TradingBot(commands.Cog):
         except Exception as e:
             logger.error(f"❌ Could not open DM with USER_ID: {e}")
         return None
+
+    @tasks.loop(minutes=5)
+    async def daily_summary(self):
+        """Post one wrap-up after the close: what happened, and tomorrow's plan."""
+        now = datetime.now(ET)
+        if now.weekday() >= 5:
+            return
+        # Fire once, in the window just after the bell.
+        if not (dtime(16, 5) <= now.time() <= dtime(16, 30)):
+            return
+        today = now.date()
+        if self._last_daily_summary == today:
+            return
+        channel = await self._destination()
+        if not channel:
+            return
+        try:
+            embed = await asyncio.to_thread(self._daily_summary_embed, today)
+            await channel.send(embed=embed)
+            self._last_daily_summary = today
+            logger.info(f"Posted daily summary for {today}")
+        except Exception as e:
+            logger.error(f"Daily summary failed: {e}")
+
+    def _daily_summary_embed(self, day):
+        """Today's realised result plus what the bot intends to do tomorrow."""
+        conn = self.budget_tracker.conn
+        rows = conn.execute(
+            "SELECT symbol, side, shares, price, amount, realized_pnl, created_at "
+            "FROM trades WHERE status = 'EXECUTED' AND date(created_at) = ? "
+            "ORDER BY id", (day.isoformat(),)).fetchall()
+
+        closed = [r for r in rows if r['realized_pnl'] is not None]
+        buys = [r for r in rows if r['side'] == 'BUY']
+        realized = sum(r['realized_pnl'] for r in closed)
+        wins = [r for r in closed if r['realized_pnl'] > 0]
+        losses = [r for r in closed if r['realized_pnl'] < 0]
+
+        pnl = self.budget_tracker.get_pnl(self.engine.latest_price)
+        positions = pnl['positions']
+        total_day = realized + pnl['unrealized']
+
+        colour = (discord.Color.green() if total_day > 0 else
+                  discord.Color.red() if total_day < 0 else discord.Color.greyple())
+        e = discord.Embed(
+            title=f"🔔 Daily wrap — {day.strftime('%A %d %B')}",
+            color=colour, timestamp=datetime.now().astimezone())
+
+        arrow = "📈 UP" if realized > 0 else "📉 DOWN" if realized < 0 else "➖ FLAT"
+        money = (f"**{arrow} ${abs(realized):,.2f}** booked today\n"
+                 f"{len(buys)} buy(s), {len(closed)} position(s) closed")
+        if closed:
+            money += (f"\nWon {len(wins)} · lost {len(losses)} "
+                      f"({len(wins) / len(closed):.0%} win rate)")
+        if positions:
+            money += (f"\nStill open: **${pnl['unrealized']:+,.2f}** unrealised "
+                      f"across {len(positions)} position(s)")
+        e.add_field(name="💰 Today", value=money, inline=False)
+
+        if closed:
+            e.add_field(
+                name="📋 Closed today",
+                value="\n".join(
+                    f"{'🟩' if r['realized_pnl'] > 0 else '🟥'} **{r['symbol']}** "
+                    f"{r['shares']} @ ${r['price']:,.2f} → **${r['realized_pnl']:+,.2f}**"
+                    for r in closed[:10]),
+                inline=False)
+
+        if positions:
+            e.add_field(
+                name="🌙 Holding overnight",
+                value="\n".join(
+                    f"{'🪙' if p['symbol'].endswith('-USD') else '📈'} **{p['symbol']}** "
+                    f"x{p['shares']} @ ${p['avg_price']:,.2f}"
+                    + (f" → ${p['price']:,.2f} (**{p['pnl_pct']:+.2%}**)"
+                       if p.get('pnl') is not None else "")
+                    for p in positions),
+                inline=False)
+            e.add_field(
+                name="ℹ️ Why anything is still open",
+                value=("Stocks are flattened before the bell, so anything here is "
+                       "crypto — it trades overnight and through the weekend."),
+                inline=False)
+
+        # ---- tomorrow ----
+        plan = []
+        metrics = (self.intraday.metrics if self.intraday else {}) or {}
+        for cls, m in sorted(metrics.items()):
+            verdict = ("will trade" if m['ev'] > 0 else
+                       "**blocked — negative expected value**")
+            plan.append(f"{'🪙' if cls == 'crypto' else '📈'} **{cls}**: "
+                        f"precision {m['precision']:.1%} vs break-even "
+                        f"{m['breakeven']:.1%} → EV {m['ev'] * 100:+.3f}%/trade, {verdict}")
+        cash = self.budget_tracker.get_remaining_budget()
+        plan.append(f"💵 **${cash:,.2f}** of ${self.budget_tracker.weekly_budget:,.2f} "
+                    f"budget available")
+        if self.fast:
+            rules = " · ".join(
+                f"{'🪙' if c == 'crypto' else '📈'} {c} +{barriers(c)[0]:.1%}/"
+                f"−{barriers(c)[1]:.1%}"
+                for c in sorted((self.intraday.metrics if self.intraday else {}) or {}))
+            plan.append(f"🎯 Up to **{self.fast.max_positions}** positions · "
+                        + (rules or "no models trained"))
+        nxt = day + timedelta(days=1)
+        while nxt.weekday() >= 5:
+            nxt += timedelta(days=1)
+        plan.append(f"⏰ Stocks resume **09:30 ET {nxt.strftime('%a %d %b')}**; "
+                    f"crypto keeps trading tonight.")
+        e.add_field(name="🗺️ Game plan for tomorrow", value="\n".join(plan), inline=False)
+
+        e.set_footer(text="PAPER TRADING — no broker, no real money. "
+                          "One good day is not evidence; judge it over weeks.")
+        return e
 
     @tasks.loop(seconds=float(os.getenv('FAST_POLL_SECONDS', 60)))
     async def fast_cycle(self):
@@ -495,9 +627,10 @@ class TradingBot(commands.Cog):
             e.add_field(
                 name=f"BOUGHT {x['shares']} {x['symbol']} @ ${x['price']:,.2f}",
                 value=(f"Cost ${x['cost']:,.2f} · model confidence "
-                       f"{x['probability']:.1%} (bar {s.get('bar', 0):.3f})\n"
-                       f"Will sell on +{self.fast.take_profit:.1%}, "
-                       f"−{self.fast.stop_loss:.1%}, or before the close."),
+                       f"{x['probability']:.1%}\n"
+                       f"Will sell on **+{barriers(asset_class(x['symbol']))[0]:.1%}** "
+                       f"or **−{barriers(asset_class(x['symbol']))[1]:.1%}**"
+                       + ("" if is_crypto(x['symbol']) else ", or before the close.")),
                 inline=False)
         e.add_field(name="Cash left",
                     value=f"${self.budget_tracker.get_remaining_budget():,.2f}",

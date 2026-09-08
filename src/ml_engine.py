@@ -322,12 +322,25 @@ class TradingSignalEngine:
         return results[:limit] if limit else results
 
     def stored_close(self, symbol: str):
-        """Most recent stored close, or None."""
+        """Most recent stored close from daily bars, else intraday bars.
+
+        Crypto never enters the daily `prices` table - the daily engine only
+        fetches the S&P 500 - so without the intraday fallback every crypto
+        position reports "price unavailable" in /pnl.
+        """
         row = self.conn.execute(
             "SELECT close FROM prices WHERE symbol = ? ORDER BY date DESC LIMIT 1",
             (symbol,),
         ).fetchone()
-        return float(row['close']) if row else None
+        if row:
+            return float(row['close'])
+        try:
+            row = self.conn.execute(
+                "SELECT close FROM prices_intraday WHERE symbol = ? "
+                "ORDER BY ts DESC LIMIT 1", (symbol,)).fetchone()
+            return float(row['close']) if row else None
+        except Exception:
+            return None
 
     def latest_price(self, symbol: str):
         """Live quote if any provider can give one, else the last stored close.

@@ -17,7 +17,8 @@ import os
 import logging
 from datetime import datetime, timedelta
 
-from src.intraday_engine import market_state, minutes_to_close, ET, is_crypto
+from src.intraday_engine import (market_state, minutes_to_close, ET,
+                                 is_crypto, asset_class, barriers)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,21 @@ class FastTrader:
             self.last_summary = summary
             return summary
 
+        # Refuse to trade an asset class whose backtested expected value is
+        # negative. Now that stocks and crypto have separate models this is
+        # per-class, so a losing crypto model no longer drags stocks down with
+        # it (or vice versa). Set FAST_IGNORE_EV=1 to override deliberately.
+        respect_ev = os.getenv('FAST_IGNORE_EV', '0') not in ('1', 'true', 'yes')
+        blocked = set()
+        if respect_ev:
+            for cls, m in (self.engine.metrics or {}).items():
+                if m.get('ev', 0) <= 0:
+                    blocked.add(cls)
+        summary['blocked_classes'] = sorted(blocked)
+
         def tradeable(sym):
+            if respect_ev and asset_class(sym) in blocked:
+                return False
             return stocks_open or is_crypto(sym)
 
         rows = self.engine.fetch()
@@ -96,20 +111,27 @@ class FastTrader:
 
         # ---- EXITS first: frees cash and slots within this same cycle ----
         for sym, pos in held.items():
-            if not tradeable(sym):
+            # Exits ignore the EV block: an already-open position must always be
+            # closeable, otherwise a newly-negative model would strand it.
+            if not (stocks_open or is_crypto(sym)):
                 continue
             sig = self.engine.signal(sym)
             price = self._price(sym, sig['price'] if sig else pos['avg_price'])
             change = (price - pos['avg_price']) / pos['avg_price'] if pos['avg_price'] else 0
             reason = None
 
+            # Exits must use the SAME barriers the model was trained on, and
+            # those differ by asset class.
+            cls = asset_class(sym)
+            tp, sl, _ = barriers(cls)
+
             # Crypto has no close to flatten into - holding it overnight is
             # normal, so the EOD rule applies to stocks only.
             if not is_crypto(sym) and to_close <= self.eod_flatten_min:
                 reason = f"end of day ({to_close:.0f} min to close)"
-            elif change <= -self.stop_loss:
+            elif change <= -sl:
                 reason = f"stop loss {change:+.2%}"
-            elif change >= self.take_profit:
+            elif change >= tp:
                 reason = f"take profit {change:+.2%}"
             else:
                 opened = self.entry_time.get(sym)
@@ -139,7 +161,9 @@ class FastTrader:
         slots = self.max_positions - len(held)
         candidates = self.engine.scan()
         summary['candidates'] = candidates[:5]
-        summary['bar'] = self.engine.threshold()
+        summary['bars'] = {c: self.engine.threshold(c)
+                           for c in (self.engine.metrics or {'stock': {}})}
+        summary['bar'] = min(summary['bars'].values(), default=0.0)
 
         if slots <= 0:
             summary['note'] = f"Holding {len(held)}/{self.max_positions} - no free slots."
@@ -152,6 +176,9 @@ class FastTrader:
                 break
             sym = sig['symbol']
             if sym in held:
+                continue
+            if respect_ev and asset_class(sym) in blocked:
+                summary['skipped'].append((sym, f"{asset_class(sym)} model has negative EV"))
                 continue
             if not tradeable(sym):
                 summary['skipped'].append((sym, 'market closed'))

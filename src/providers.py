@@ -246,6 +246,11 @@ class FinnhubProvider(Provider):
     def quote(self, symbol):
         if self._blocked:
             return None
+        # Finnhub does not know Yahoo's "ADA-USD" form; its crypto symbols are
+        # exchange-qualified (BINANCE:ADAUSDT). Rather than guess an exchange,
+        # decline crypto here and let the next provider answer.
+        if symbol.upper().endswith(('-USD', '-USDT')):
+            return None
         try:
             d = _get_json("https://finnhub.io/api/v1/quote"
                           f"?symbol={symbol}&token={self.key}")
@@ -276,7 +281,13 @@ class YahooQuoteProvider(Provider):
             if not res:
                 return None
             meta = res[0].get('meta') or {}
-            price = meta.get('regularMarketPrice')
+            # Crypto responses often omit regularMarketPrice; fall back to the
+            # last close in the series before giving up.
+            price = meta.get('regularMarketPrice') or meta.get('previousClose')
+            if not price:
+                q = ((res[0].get('indicators') or {}).get('quote') or [{}])[0]
+                closes = [c for c in (q.get('close') or []) if c]
+                price = closes[-1] if closes else None
             return float(price) if price else None
         except Exception as e:
             logger.debug(f"[yahoo_quote] {symbol}: {e}")

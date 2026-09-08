@@ -12,6 +12,7 @@ Deliberately narrow: a small, liquid universe so a full refresh takes seconds.
 """
 
 import os
+import json
 import logging
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
@@ -43,6 +44,41 @@ PERIOD = os.getenv('INTRADAY_PERIOD', '60d')             # 1m maxes out at 7d
 HORIZON = int(os.getenv('INTRADAY_HORIZON_BARS', 24))    # 24 x 5m = 2 hours
 TAKE_PROFIT = float(os.getenv('FAST_TAKE_PROFIT', 0.008))
 STOP_LOSS = float(os.getenv('FAST_STOP_LOSS', 0.005))
+
+# Per-asset-class overrides written by tune.py. Stocks and crypto do not want
+# the same barriers - a sweep on 2026-09-08 put stocks at +1.2%/-0.7% over 240
+# min (EV +1.057%/trade) and crypto at +0.8%/-0.5% over 180 min (+0.355%).
+TUNED_PATH = os.getenv('TUNED_PATH', 'data/tuned.json')
+
+
+def _load_tuned():
+    try:
+        with open(TUNED_PATH) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+TUNED = _load_tuned()
+
+
+def barriers(cls='stock'):
+    """(take_profit, stop_loss, horizon_bars) for one asset class."""
+    t = TUNED.get(cls) or {}
+    return (float(t.get('take_profit', TAKE_PROFIT)),
+            float(t.get('stop_loss', STOP_LOSS)),
+            int(t.get('horizon', HORIZON)))
+
+
+def model_params(cls='stock'):
+    t = TUNED.get(cls) or {}
+    return t.get('params') or dict(max_iter=250, learning_rate=0.06,
+                                   max_depth=5, l2_regularization=1.0)
+
+
+def prob_ratio(cls='stock'):
+    t = TUNED.get(cls) or {}
+    return float(t.get('ratio', PROB_RATIO))
 THRESHOLD = float(os.getenv('INTRADAY_THRESHOLD', 0.0015))   # legacy label only
 # Only ~36% of bars are positive, so the model's probabilities cluster near that
 # base rate and a fixed 0.55 bar is never cleared. Select relative to the base
@@ -53,7 +89,18 @@ MODEL_PATH = os.getenv('INTRADAY_MODEL_PATH', 'data/intraday_model.joblib')
 DEFAULT_FAST = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'GOOGL', 'META', 'AMD',
                 'CRWD', 'GLW', 'NFLX', 'INTC', 'MU', 'PLTR', 'SMCI', 'AVGO',
                 'QCOM', 'ORCL', 'ADBE', 'NOW', 'F', 'SOFI', 'BAC', 'T',
-                'PFE', 'CSCO', 'WBD', 'RIVN', 'LCID', 'HOOD']
+                'PFE', 'CSCO', 'WBD', 'RIVN', 'LCID', 'HOOD',
+                # Widened 2026-09-08: the tuning sweep showed 80 symbols yields
+                # 287k training rows vs 112k for 30, and the wider model scored
+                # EV +1.057%/trade against +0.278%. More symbols is the cheapest
+                # real gain available - 5m history is capped at 60 days, so
+                # breadth is the only way to add data.
+                'UBER', 'SHOP', 'SQ', 'COIN', 'MARA', 'RIOT', 'DKNG', 'SNAP',
+                'PINS', 'ROKU', 'ZM', 'DOCU', 'TWLO', 'NET', 'DDOG', 'SNOW',
+                'ABNB', 'LYFT', 'CVNA', 'AFRM', 'UPST', 'PATH', 'U', 'RBLX',
+                'TTD', 'ETSY', 'EBAY', 'PYPL', 'V', 'MA', 'JPM', 'GS', 'MS',
+                'WFC', 'C', 'XOM', 'CVX', 'COP', 'SLB', 'OXY', 'JNJ', 'MRK',
+                'ABBV', 'LLY', 'UNH', 'WMT', 'TGT', 'COST', 'HD', 'LOW']
 
 # Crypto trades 24/7/365, so it produces ~3.7x the bars per calendar day and is
 # tradeable when the stock market is shut. Yahoo serves it under the -USD suffix.
@@ -64,6 +111,17 @@ DEFAULT_CRYPTO = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD',
 
 def is_crypto(symbol: str) -> bool:
     return symbol.upper().endswith(('-USD', '-USDT'))
+
+
+def asset_class(symbol: str) -> str:
+    """Which model a symbol is scored by.
+
+    Stocks and crypto have different volatility regimes and different session
+    structure, so one pooled model serves neither well: measured 2026-09-08,
+    a combined model scored 47.9% precision where separate models scored 90.0%
+    (stocks) and 72.9% (crypto) on the same barriers.
+    """
+    return 'crypto' if is_crypto(symbol) else 'stock'
 
 FEATURES = [
     'ret_1', 'ret_3', 'ret_6', 'ret_12',
@@ -155,7 +213,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_target(df: pd.DataFrame) -> pd.Series:
+def build_target(df: pd.DataFrame, cls: str = 'stock') -> pd.Series:
     """Triple-barrier label: did take-profit come before stop-loss?
 
     This is the honest target because it is the SAME question the executor
@@ -163,38 +221,57 @@ def build_target(df: pd.DataFrame) -> pd.Series:
     a much easier event than the trade actually placed, which is why it looked
     accurate while losing money.
     """
+    tp, sl, hz = barriers(cls)
     if os.getenv('LABEL_MODE', 'triple') == 'fixed':
-        return fixed_horizon(df['close'], THRESHOLD, HORIZON)
-    return triple_barrier(df['high'], df['low'], df['close'],
-                          TAKE_PROFIT, STOP_LOSS, HORIZON)
+        return fixed_horizon(df['close'], THRESHOLD, hz)
+    return triple_barrier(df['high'], df['low'], df['close'], tp, sl, hz)
 
 
 class IntradayEngine:
     def __init__(self, db_path=None):
         self.conn = connect(db_path)
-        self.model = None
+        # One model per asset class, each with its own base rate and bar.
+        self.models = {}          # class -> fitted estimator
+        self.metrics = {}         # class -> metrics dict
+        self.base_rates = {}      # class -> positive rate on that class
         self.symbols = fast_universe()
-        self.last_metrics = {}
+        self.last_metrics = {}    # the better-performing class, for summaries
         Path(MODEL_PATH).parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
-        self.positive_rate = 0.36
         if Path(MODEL_PATH).exists():
             try:
                 blob = joblib.load(MODEL_PATH)
-                if isinstance(blob, dict):
-                    self.model = blob['model']
-                    self.last_metrics = blob.get('meta', {})
-                    self.positive_rate = self.last_metrics.get('positive_rate', 0.36)
-                else:
-                    self.model = blob
-                logger.info(f"Loaded intraday model (base rate "
-                            f"{self.positive_rate:.1%}, bar {self.threshold():.3f})")
+                if isinstance(blob, dict) and 'models' in blob:
+                    self.models = blob['models']
+                    self.metrics = blob.get('metrics', {})
+                    self.base_rates = blob.get('base_rates', {})
+                elif isinstance(blob, dict) and 'model' in blob:
+                    # Legacy single pooled model - treat it as the stock model.
+                    self.models = {'stock': blob['model']}
+                    self.metrics = {'stock': blob.get('meta', {})}
+                    self.base_rates = {'stock': blob.get('meta', {}).get('positive_rate', 0.3)}
+                self._pick_headline()
+                for cls, m in self.metrics.items():
+                    logger.info(f"Loaded {cls} model: precision {m.get('precision', 0):.1%} "
+                                f"vs breakeven {m.get('breakeven', 0):.1%}, "
+                                f"bar {self.threshold(cls):.3f}")
             except Exception as e:
-                logger.warning(f"Could not load intraday model ({e})")
+                logger.warning(f"Could not load intraday models ({e})")
 
-    def threshold(self):
-        """Selection bar, scaled to the model's own base rate."""
-        return min(0.95, self.positive_rate * PROB_RATIO)
+    @property
+    def model(self):
+        """Back-compat: any loaded model means the engine is usable."""
+        return next(iter(self.models.values()), None)
+
+    def _pick_headline(self):
+        """last_metrics summarises whichever class currently looks strongest."""
+        if self.metrics:
+            self.last_metrics = max(self.metrics.values(),
+                                    key=lambda m: m.get('ev', -1))
+
+    def threshold(self, cls='stock'):
+        """Selection bar for one asset class, scaled to its own base rate."""
+        return min(0.95, self.base_rates.get(cls, 0.30) * prob_ratio(cls))
 
     def _ensure_schema(self):
         with self.conn:
@@ -260,72 +337,86 @@ class IntradayEngine:
     # --- training --------------------------------------------------------
 
     def train(self) -> bool:
-        frames = []
+        """Train one model per asset class. Succeeds if at least one trains."""
+        by_class = {}
         for sym in self.symbols:
             h = self._history(sym)
             if len(h) < 300:
                 continue
             f = build_features(h)
-            f['target'] = build_target(h)
-            frames.append(f.dropna())
-        if not frames:
+            f['target'] = build_target(h, asset_class(sym))
+            f = f.dropna()
+            if not f.empty:
+                by_class.setdefault(asset_class(sym), []).append(f)
+
+        if not by_class:
             logger.error("[intraday] no usable data - fetch first")
             return False
 
-        data = pd.concat(frames).replace([np.inf, -np.inf], np.nan).dropna()
-        if len(data) < 2000:
-            logger.error(f"[intraday] only {len(data)} rows, need 2000+")
+        trained_any = False
+        for cls, frames in by_class.items():
+            n_syms = len(frames)
+            data = pd.concat(frames).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(data) < 2000:
+                logger.warning(f"[intraday/{cls}] only {len(data)} rows, need 2000+")
+                continue
+            data = data.sort_index()
+            tp, sl, hz = barriers(cls)
+            X, y = data[FEATURES], data['target']
+            Xtr, Xte, ytr, yte = purged_split(
+                X, y, test_size=0.2, embargo_bars=hz * max(n_syms, 1))
+            if len(Xtr) < 1000 or ytr.mean() <= 0.01:
+                logger.warning(f"[intraday/{cls}] unusable split "
+                               f"({len(Xtr)} rows, {ytr.mean():.1%} positive)")
+                continue
+
+            model = HistGradientBoostingClassifier(random_state=42,
+                                                   **model_params(cls))
+            model.fit(Xtr, ytr)
+
+            acc = accuracy_score(yte, model.predict(Xte))
+            base = max(yte.mean(), 1 - yte.mean())
+            pos_rate = float(ytr.mean())
+            bar = min(0.95, pos_rate * prob_ratio(cls))
+            picked = model.predict_proba(Xte)[:, 1] >= bar
+            prec = float(precision_score(yte, picked, zero_division=0)) if picked.sum() else 0.0
+            breakeven = sl / (tp + sl)
+            ev = prec * tp - (1 - prec) * sl
+
+            self.models[cls] = model
+            self.base_rates[cls] = pos_rate
+            self.metrics[cls] = {
+                'asset_class': cls, 'symbols': n_syms,
+                'accuracy': acc, 'baseline': base, 'edge': acc - base,
+                'rows': len(Xtr), 'positive_rate': pos_rate,
+                'interval': INTERVAL, 'horizon_bars': hz,
+                'take_profit': tp, 'stop_loss': sl,
+                'precision': prec, 'breakeven': breakeven, 'ev': ev,
+                'test_signals': int(picked.sum()), 'bar': bar,
+            }
+            trained_any = True
+            verdict = "profitable" if ev > 0 else "LOSES MONEY"
+            logger.info(f"[intraday/{cls}] {n_syms} symbols, {len(Xtr):,} rows | "
+                        f"precision {prec:.1%} vs breakeven {breakeven:.1%} on "
+                        f"{int(picked.sum()):,} signals | EV {ev * 100:+.3f}%/trade "
+                        f"({verdict}) | bar p>{bar:.3f}")
+            if ev <= 0:
+                logger.warning(f"[intraday/{cls}] NEGATIVE EXPECTED VALUE - this "
+                               f"asset class is not tradeable on these barriers")
+
+        if not trained_any:
             return False
-        data = data.sort_index()
-
-        X, y = data[FEATURES], data['target']
-        # Embargo the overlap: a label at bar i depends on bars i+1..i+HORIZON,
-        # so without a gap the last training rows peek into the test window.
-        Xtr, Xte, ytr, yte = purged_split(
-            X, y, test_size=0.2, embargo_bars=HORIZON * max(len(self.symbols), 1))
-
-        model = HistGradientBoostingClassifier(max_iter=250, learning_rate=0.06,
-                                               max_depth=5, l2_regularization=1.0,
-                                               random_state=42)
-        model.fit(Xtr, ytr)
-        acc = accuracy_score(yte, model.predict(Xte))
-        base = max(yte.mean(), 1 - yte.mean())
-        pos_rate = float(ytr.mean())
-
-        # Precision at the live selection bar is the number that decides whether
-        # this makes money: EV = precision*TP - (1-precision)*SL.
-        bar = min(0.97, pos_rate * PROB_RATIO)
-        picked = model.predict_proba(Xte)[:, 1] >= bar
-        prec = float(precision_score(yte, picked, zero_division=0)) if picked.sum() else 0.0
-        breakeven = STOP_LOSS / (TAKE_PROFIT + STOP_LOSS)
-        ev = prec * TAKE_PROFIT - (1 - prec) * STOP_LOSS
-
-        self.last_metrics = {
-            'accuracy': acc, 'baseline': base, 'edge': acc - base,
-            'rows': len(Xtr), 'positive_rate': pos_rate,
-            'interval': INTERVAL, 'horizon_bars': HORIZON,
-            'take_profit': TAKE_PROFIT, 'stop_loss': STOP_LOSS,
-            'precision': prec, 'breakeven': breakeven, 'ev': ev,
-            'test_signals': int(picked.sum()),
-        }
-        logger.info(f"[intraday] {len(Xtr):,} rows | {INTERVAL} x{HORIZON} bars "
-                    f"(+{TAKE_PROFIT:.2%}/-{STOP_LOSS:.2%}) | precision {prec:.1%} "
-                    f"vs breakeven {breakeven:.1%} on {int(picked.sum()):,} test signals "
-                    f"| EV {ev * 100:+.3f}%/trade")
-        if ev <= 0:
-            logger.warning("[intraday] EXPECTED VALUE IS NEGATIVE - this "
-                           "configuration loses money on backtest")
-        self.model = model
-        self.positive_rate = float(ytr.mean())
-        joblib.dump({'model': model, 'meta': self.last_metrics}, MODEL_PATH)
-        logger.info(f"[intraday] selection bar is p > {self.threshold():.3f} "
-                    f"({PROB_RATIO}x the {self.positive_rate:.1%} base rate)")
+        self._pick_headline()
+        joblib.dump({'models': self.models, 'metrics': self.metrics,
+                     'base_rates': self.base_rates}, MODEL_PATH)
         return True
 
     # --- inference -------------------------------------------------------
 
     def signal(self, symbol):
-        if self.model is None:
+        cls = asset_class(symbol)
+        model = self.models.get(cls)
+        if model is None:
             return None
         h = self._history(symbol)
         if len(h) < 60:
@@ -333,10 +424,12 @@ class IntradayEngine:
         f = build_features(h).replace([np.inf, -np.inf], np.nan).dropna()
         if f.empty:
             return None
-        p_up = float(self.model.predict_proba(f[FEATURES].iloc[[-1]])[0][1])
+        p_up = float(model.predict_proba(f[FEATURES].iloc[[-1]])[0][1])
         return {
             'symbol': symbol,
+            'asset_class': cls,
             'probability': p_up,
+            'bar': self.threshold(cls),
             'price': float(h['close'].iloc[-1]),
             'bar_time': h.index[-1].astimezone(ET).strftime('%H:%M ET'),
         }
@@ -344,7 +437,6 @@ class IntradayEngine:
     def scan(self, min_probability=None):
         """Long candidates only - the target is 'moves up more than THRESHOLD',
         so a low probability means 'no move expected', not 'goes down'."""
-        bar = self.threshold() if min_probability is None else min_probability
         out = []
         for sym in self.symbols:
             try:
@@ -352,16 +444,21 @@ class IntradayEngine:
             except Exception as e:
                 logger.debug(f"[intraday] {sym}: {e}")
                 continue
-            if s:
-                s['above_bar'] = s['probability'] >= bar
-                if s['above_bar']:
-                    out.append(s)
-        out.sort(key=lambda r: r['probability'], reverse=True)
+            if not s:
+                continue
+            bar = s['bar'] if min_probability is None else min_probability
+            s['above_bar'] = s['probability'] >= bar
+            # Rank by margin over each class's own bar, not raw probability -
+            # the two classes have different base rates, so raw probabilities
+            # are not comparable across them.
+            s['margin'] = s['probability'] - bar
+            if s['above_bar']:
+                out.append(s)
+        out.sort(key=lambda r: r['margin'], reverse=True)
         return out
 
     def scan_all(self):
-        """Every symbol scored, ranked - for reporting, not trading."""
-        bar = self.threshold()
+        """Every symbol scored, ranked by margin over its own bar."""
         out = []
         for sym in self.symbols:
             try:
@@ -369,7 +466,8 @@ class IntradayEngine:
             except Exception:
                 continue
             if s:
-                s['above_bar'] = s['probability'] >= bar
+                s['above_bar'] = s['probability'] >= s['bar']
+                s['margin'] = s['probability'] - s['bar']
                 out.append(s)
-        out.sort(key=lambda r: r['probability'], reverse=True)
+        out.sort(key=lambda r: r['margin'], reverse=True)
         return out

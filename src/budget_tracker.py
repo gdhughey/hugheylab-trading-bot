@@ -2,8 +2,14 @@
 """
 Budget tracker - enforces the weekly spend cap and records trade lifecycle.
 
-Budget semantics:
-  * Only BUY trades consume budget; SELL returns capital and is not counted.
+Budget semantics (BUDGET_MODE):
+  * "deployed" (default): the budget caps CAPITAL AT RISK - the cost basis of
+    currently open positions. Selling frees it again. This is the right meaning
+    for a day-trading loop, where the same $100 may be recycled many times a
+    day; under the cumulative rule that loop would exhaust a $500 weekly cap
+    after five round trips despite never risking more than $100.
+  * "cumulative": the original meaning - total BUY volume booked this week,
+    never refunded by a sale. Appropriate for buy-and-hold, not for day trading.
   * "Committed" = EXECUTED + PENDING. can_trade()/get_remaining_budget() work
     against committed spend so that trades awaiting Discord approval cannot
     collectively overshoot the weekly cap.
@@ -48,13 +54,38 @@ class BudgetTracker:
         ).fetchone()
         return float(row['total'])
 
+    def _deployed(self) -> float:
+        """Cost basis of open positions, plus anything awaiting approval."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(shares * avg_price), 0) AS v FROM positions "
+            "WHERE shares > 0").fetchone()
+        pending = self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS v FROM trades "
+            "WHERE status = 'PENDING' AND side = 'BUY'").fetchone()
+        return float(row['v']) + float(pending['v'])
+
     def _committed(self) -> float:
-        return self._sum(('EXECUTED', 'PENDING'))
+        if os.getenv('BUDGET_MODE', 'deployed') == 'cumulative':
+            return self._sum(('EXECUTED', 'PENDING'))
+        return self._deployed()
 
     # --- budget ----------------------------------------------------------
 
     def get_weekly_spent(self) -> float:
-        """Money actually spent this week (approved trades only)."""
+        """What the embeds label "Spent".
+
+        In deployed mode that is capital currently at risk; in cumulative mode
+        it is total executed buy volume for the week.
+        """
+        if os.getenv('BUDGET_MODE', 'deployed') == 'cumulative':
+            return self._sum(('EXECUTED',))
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(shares * avg_price), 0) AS v FROM positions "
+            "WHERE shares > 0").fetchone()
+        return float(row['v'])
+
+    def get_turnover(self) -> float:
+        """Total executed BUY volume this week, regardless of budget mode."""
         return self._sum(('EXECUTED',))
 
     def get_remaining_budget(self) -> float:
@@ -240,7 +271,8 @@ class BudgetTracker:
             'Open Positions': len(self.get_positions()),
             'Week': _week_key(),
             'Weekly Budget': f"${self.weekly_budget:,.2f}",
-            'Spent This Week': f"${self.get_weekly_spent():,.2f}",
+            'Capital Deployed': f"${self.get_weekly_spent():,.2f}",
+            'Turnover This Week': f"${self.get_turnover():,.2f}",
             'Remaining': f"${self.get_remaining_budget():,.2f}",
             'Realized P&L': f"${self.get_realized_pnl():,.2f}",
         }
