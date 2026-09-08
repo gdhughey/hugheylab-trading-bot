@@ -17,7 +17,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 
-from src.intraday_engine import market_state, minutes_to_close, ET
+from src.intraday_engine import market_state, minutes_to_close, ET, is_crypto
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +42,9 @@ class FastTrader:
     @property
     def max_positions(self): return int(_cfg('FAST_MAX_POSITIONS', 3, int))
     @property
-    def stop_loss(self): return _cfg('FAST_STOP_LOSS', 0.010)
+    def stop_loss(self): return _cfg('FAST_STOP_LOSS', 0.005)
     @property
-    def take_profit(self): return _cfg('FAST_TAKE_PROFIT', 0.015)
+    def take_profit(self): return _cfg('FAST_TAKE_PROFIT', 0.008)
     @property
     def eod_flatten_min(self): return _cfg('FAST_EOD_FLATTEN_MIN', 10)
     @property
@@ -71,13 +71,21 @@ class FastTrader:
         everything in here (yfinance, sklearn, sqlite) blocks.
         """
         state, desc = market_state()
+        stocks_open = state == 'open'
+        crypto_syms = [s for s in self.engine.symbols if is_crypto(s)]
         summary = {'state': state, 'desc': desc, 'exits': [], 'entries': [],
-                   'skipped': [], 'candidates': [], 'ts': datetime.now(ET)}
+                   'skipped': [], 'candidates': [], 'ts': datetime.now(ET),
+                   'stocks_open': stocks_open, 'crypto': len(crypto_syms)}
 
-        if state != 'open':
-            summary['note'] = f"Market {desc} - not trading."
+        # Crypto never closes, so an outside-hours cycle is still a working
+        # cycle whenever the universe holds any coins.
+        if not stocks_open and not crypto_syms:
+            summary['note'] = f"Market {desc}, no crypto in universe - not trading."
             self.last_summary = summary
             return summary
+
+        def tradeable(sym):
+            return stocks_open or is_crypto(sym)
 
         rows = self.engine.fetch()
         summary['rows'] = rows
@@ -88,12 +96,16 @@ class FastTrader:
 
         # ---- EXITS first: frees cash and slots within this same cycle ----
         for sym, pos in held.items():
-            price = self._price(sym, self.engine.signal(sym)['price']
-                                if self.engine.signal(sym) else pos['avg_price'])
+            if not tradeable(sym):
+                continue
+            sig = self.engine.signal(sym)
+            price = self._price(sym, sig['price'] if sig else pos['avg_price'])
             change = (price - pos['avg_price']) / pos['avg_price'] if pos['avg_price'] else 0
             reason = None
 
-            if to_close <= self.eod_flatten_min:
+            # Crypto has no close to flatten into - holding it overnight is
+            # normal, so the EOD rule applies to stocks only.
+            if not is_crypto(sym) and to_close <= self.eod_flatten_min:
                 reason = f"end of day ({to_close:.0f} min to close)"
             elif change <= -self.stop_loss:
                 reason = f"stop loss {change:+.2%}"
@@ -117,7 +129,8 @@ class FastTrader:
                             f"({reason}) P&L ${pnl:+,.2f}")
 
         # ---- ENTRIES ------------------------------------------------------
-        if to_close <= self.eod_flatten_min:
+        near_bell = stocks_open and to_close <= self.eod_flatten_min
+        if near_bell and not crypto_syms:
             summary['note'] = "Too close to the bell to open anything new."
             self.last_summary = summary
             return summary
@@ -139,6 +152,12 @@ class FastTrader:
                 break
             sym = sig['symbol']
             if sym in held:
+                continue
+            if not tradeable(sym):
+                summary['skipped'].append((sym, 'market closed'))
+                continue
+            if near_bell and not is_crypto(sym):
+                summary['skipped'].append((sym, 'too close to the bell'))
                 continue
             if self.cooldown.get(sym, now) > now:
                 summary['skipped'].append((sym, 'cooling down'))

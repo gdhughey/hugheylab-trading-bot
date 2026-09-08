@@ -82,6 +82,40 @@ actually changes during the session.
 Trained on 111,666 rows across 30 liquid names; a full refresh takes ~6s, so a
 60-second loop is comfortable.
 
+### Labeling: the fix that mattered most
+
+The original label asked *"is price higher in 30 minutes?"* But the executor
+exits at **+TP or −SL, whichever comes first**. Those are different questions.
+If price first drops through the stop and only then rallies, the old label
+called it a **win** while the real trade was a **loss** — the model was being
+trained to chase outcomes it could not capture.
+
+`src/labeling.py` implements **triple-barrier labeling** (López de Prado): walk
+the forward path bar by bar using highs and lows, and label by which barrier is
+touched first. Training target and live outcome are now the same question.
+
+Training also uses a **purged split** — a label at bar *i* depends on bars
+*i+1…i+horizon*, so without an embargo gap the last training rows peek into the
+test window and the score is inflated.
+
+### What the honest label revealed
+
+Measured sweep, 2026-09-08, 60 days of 5m bars:
+
+| TP / SL | Horizon | Base rate | Precision | Break-even | EV/trade |
+|---|---|---|---|---|---|
+| +1.5% / −1.0% | 30 min | 6.4% | 35.5% | 40.0% | **−0.113%** |
+| +0.8% / −0.5% | 120 min | 30.5% | 90.0% | 38.5% | **+0.670%** |
+
+**The original +1.5%/−1.0% over 30 minutes was the worst configuration tested —
+negative expected value on both stocks and crypto.** A 1.5% move inside 30
+minutes happens on only 6.4% of stock bars (1.3% of crypto bars), while the 1.0%
+stop is hit constantly. Defaults are now **+0.8% / −0.5% over 120 minutes**.
+
+The metric that decides profitability is **precision against break-even**, not
+accuracy: `EV = precision × TP − (1 − precision) × SL`, break-even at
+`SL / (TP + SL)`. `/fast` reports it and warns when EV is negative.
+
 **Threshold calibration matters.** Only ~36% of intraday bars are positive, so
 the model's probabilities cluster near that base rate and a fixed 0.55 bar is
 *never* cleared. The selection bar is therefore relative:
@@ -100,8 +134,15 @@ and freed capital is reusable in the same pass:
 | Re-entry cooldown | 15 min |
 | Max concurrent positions | 3 |
 
-Trading only happens during the regular session (09:30–16:00 ET, weekdays);
-outside those hours the loop reports and does nothing.
+Stock trading happens only during the regular session (09:30–16:00 ET,
+weekdays). **Crypto (`TRADE_CRYPTO=1`) trades 24/7** — it produces ~3.7× the bars
+per calendar day, is tradeable when the stock market is shut, and is exempt from
+the end-of-day flatten since there is no close to flatten into.
+
+**Known limitation:** stocks and crypto currently share one pooled model. On the
+combined universe precision is 47.9% (EV +0.122%/trade over 20,184 held-out
+signals); trained separately the sweep showed 90.0% for stocks and 72.9% for
+crypto. Separate per-asset-class models are the obvious next improvement.
 
 ## Honest performance note
 

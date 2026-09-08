@@ -264,13 +264,18 @@ class TradingBot(commands.Cog):
             e = discord.Embed(
                 title=f"⚡ Intraday mode — market is {desc}",
                 color=discord.Color.gold() if state == 'open' else discord.Color.greyple())
+            ev = m.get('ev', 0)
             e.add_field(
                 name="Model",
-                value=(f"{m.get('interval', '?')} bars, predicting a "
-                       f">{m.get('threshold', 0):.2%} move within "
-                       f"{m.get('horizon_bars', 0)} bars\n"
-                       f"Accuracy **{m.get('accuracy', 0):.3f}** vs baseline "
-                       f"**{m.get('baseline', 0):.3f}** → edge **{m.get('edge', 0):+.3f}**\n"
+                value=(f"{m.get('interval', '?')} bars · target **+{m.get('take_profit', 0):.2%}** "
+                       f"before **−{m.get('stop_loss', 0):.2%}** within "
+                       f"{m.get('horizon_bars', 0)} bars "
+                       f"({m.get('horizon_bars', 0) * 5} min)\n"
+                       f"Precision **{m.get('precision', 0):.1%}** vs break-even "
+                       f"**{m.get('breakeven', 0):.1%}** on {m.get('test_signals', 0):,} "
+                       f"held-out signals\n"
+                       f"**Expected value {ev * 100:+.3f}% per trade** "
+                       f"{'✅' if ev > 0 else '⚠️ NEGATIVE — this loses money'}\n"
                        f"Trained on {m.get('rows', 0):,} rows"),
                 inline=False)
             e.add_field(

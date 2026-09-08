@@ -21,10 +21,11 @@ import numpy as np
 import pandas as pd
 import joblib
 import yfinance as yf
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import accuracy_score, precision_score
 
 from src.database import connect
+from src.labeling import triple_barrier, fixed_horizon, purged_split
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,17 @@ ET = ZoneInfo("America/New_York")
 
 INTERVAL = os.getenv('INTRADAY_INTERVAL', '5m')          # 1m | 5m | 15m
 PERIOD = os.getenv('INTRADAY_PERIOD', '60d')             # 1m maxes out at 7d
-HORIZON = int(os.getenv('INTRADAY_HORIZON_BARS', 6))     # 6 x 5m = 30 min ahead
-THRESHOLD = float(os.getenv('INTRADAY_THRESHOLD', 0.0015))   # 0.15% - must beat spread
+
+# Horizon and barriers were re-derived from a measured sweep on 2026-09-08.
+# The original +1.5%/-1.0% over 30 minutes was the WORST config tested: a 1.5%
+# move inside 30 min happens on only 6.4% of stock bars (1.3% of crypto bars),
+# while the 1.0% stop is hit constantly - expected value was NEGATIVE on both
+# asset classes. +0.8%/-0.5% over 120 minutes was positive on both, with enough
+# signals to be believable.
+HORIZON = int(os.getenv('INTRADAY_HORIZON_BARS', 24))    # 24 x 5m = 2 hours
+TAKE_PROFIT = float(os.getenv('FAST_TAKE_PROFIT', 0.008))
+STOP_LOSS = float(os.getenv('FAST_STOP_LOSS', 0.005))
+THRESHOLD = float(os.getenv('INTRADAY_THRESHOLD', 0.0015))   # legacy label only
 # Only ~36% of bars are positive, so the model's probabilities cluster near that
 # base rate and a fixed 0.55 bar is never cleared. Select relative to the base
 # rate instead: a signal counts when p > positive_rate * this ratio.
@@ -44,6 +54,16 @@ DEFAULT_FAST = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'GOOGL', 'META', 'AMD',
                 'CRWD', 'GLW', 'NFLX', 'INTC', 'MU', 'PLTR', 'SMCI', 'AVGO',
                 'QCOM', 'ORCL', 'ADBE', 'NOW', 'F', 'SOFI', 'BAC', 'T',
                 'PFE', 'CSCO', 'WBD', 'RIVN', 'LCID', 'HOOD']
+
+# Crypto trades 24/7/365, so it produces ~3.7x the bars per calendar day and is
+# tradeable when the stock market is shut. Yahoo serves it under the -USD suffix.
+DEFAULT_CRYPTO = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD',
+                  'ADA-USD', 'AVAX-USD', 'LINK-USD', 'DOT-USD', 'LTC-USD',
+                  'BCH-USD', 'ATOM-USD', 'NEAR-USD']
+
+
+def is_crypto(symbol: str) -> bool:
+    return symbol.upper().endswith(('-USD', '-USDT'))
 
 FEATURES = [
     'ret_1', 'ret_3', 'ret_6', 'ret_12',
@@ -56,13 +76,23 @@ def fast_universe():
     spec = os.getenv('FAST_SYMBOLS', '').strip()
     if spec:
         return [t.strip().upper() for t in spec.replace(',', ' ').split() if t.strip()]
-    return list(DEFAULT_FAST)
+    syms = []
+    if os.getenv('TRADE_STOCKS', '1') in ('1', 'true', 'yes'):
+        syms += DEFAULT_FAST
+    if os.getenv('TRADE_CRYPTO', '0') in ('1', 'true', 'yes'):
+        syms += DEFAULT_CRYPTO
+    return syms or list(DEFAULT_FAST)
 
 
 # --- market hours ---------------------------------------------------------
 
-def market_state(now=None):
-    """('open'|'premarket'|'afterhours'|'closed', description)."""
+def market_state(now=None, symbol=None):
+    """('open'|'premarket'|'afterhours'|'closed', description).
+
+    Crypto never closes, so a crypto symbol is always 'open'.
+    """
+    if symbol and is_crypto(symbol):
+        return 'open', '24/7 crypto'
     now = (now or datetime.now(ET)).astimezone(ET)
     if now.weekday() >= 5:
         return 'closed', 'weekend'
@@ -125,10 +155,18 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_target(close: pd.Series) -> pd.Series:
-    """1 when the forward return over HORIZON bars clears THRESHOLD."""
-    fwd = close.shift(-HORIZON) / close - 1
-    return (fwd > THRESHOLD).astype(int)
+def build_target(df: pd.DataFrame) -> pd.Series:
+    """Triple-barrier label: did take-profit come before stop-loss?
+
+    This is the honest target because it is the SAME question the executor
+    answers. The old fixed-horizon label ("is price up 0.15% in 30 min") scored
+    a much easier event than the trade actually placed, which is why it looked
+    accurate while losing money.
+    """
+    if os.getenv('LABEL_MODE', 'triple') == 'fixed':
+        return fixed_horizon(df['close'], THRESHOLD, HORIZON)
+    return triple_barrier(df['high'], df['low'], df['close'],
+                          TAKE_PROFIT, STOP_LOSS, HORIZON)
 
 
 class IntradayEngine:
@@ -228,7 +266,7 @@ class IntradayEngine:
             if len(h) < 300:
                 continue
             f = build_features(h)
-            f['target'] = build_target(h['close'])
+            f['target'] = build_target(h)
             frames.append(f.dropna())
         if not frames:
             logger.error("[intraday] no usable data - fetch first")
@@ -241,23 +279,42 @@ class IntradayEngine:
         data = data.sort_index()
 
         X, y = data[FEATURES], data['target']
-        cut = int(len(X) * 0.8)              # chronological - no lookahead
-        Xtr, Xte, ytr, yte = X[:cut], X[cut:], y[:cut], y[cut:]
+        # Embargo the overlap: a label at bar i depends on bars i+1..i+HORIZON,
+        # so without a gap the last training rows peek into the test window.
+        Xtr, Xte, ytr, yte = purged_split(
+            X, y, test_size=0.2, embargo_bars=HORIZON * max(len(self.symbols), 1))
 
-        model = GradientBoostingClassifier(n_estimators=150, learning_rate=0.05,
-                                           max_depth=3, subsample=0.9,
-                                           random_state=42)
+        model = HistGradientBoostingClassifier(max_iter=250, learning_rate=0.06,
+                                               max_depth=5, l2_regularization=1.0,
+                                               random_state=42)
         model.fit(Xtr, ytr)
         acc = accuracy_score(yte, model.predict(Xte))
         base = max(yte.mean(), 1 - yte.mean())
+        pos_rate = float(ytr.mean())
+
+        # Precision at the live selection bar is the number that decides whether
+        # this makes money: EV = precision*TP - (1-precision)*SL.
+        bar = min(0.97, pos_rate * PROB_RATIO)
+        picked = model.predict_proba(Xte)[:, 1] >= bar
+        prec = float(precision_score(yte, picked, zero_division=0)) if picked.sum() else 0.0
+        breakeven = STOP_LOSS / (TAKE_PROFIT + STOP_LOSS)
+        ev = prec * TAKE_PROFIT - (1 - prec) * STOP_LOSS
+
         self.last_metrics = {
             'accuracy': acc, 'baseline': base, 'edge': acc - base,
-            'rows': len(Xtr), 'positive_rate': float(ytr.mean()),
-            'interval': INTERVAL, 'horizon_bars': HORIZON, 'threshold': THRESHOLD,
+            'rows': len(Xtr), 'positive_rate': pos_rate,
+            'interval': INTERVAL, 'horizon_bars': HORIZON,
+            'take_profit': TAKE_PROFIT, 'stop_loss': STOP_LOSS,
+            'precision': prec, 'breakeven': breakeven, 'ev': ev,
+            'test_signals': int(picked.sum()),
         }
-        logger.info(f"[intraday] trained on {len(Xtr):,} rows ({INTERVAL}, "
-                    f"{HORIZON} bars ahead, >{THRESHOLD:.2%}) - accuracy {acc:.3f} "
-                    f"vs baseline {base:.3f} (edge {acc - base:+.3f})")
+        logger.info(f"[intraday] {len(Xtr):,} rows | {INTERVAL} x{HORIZON} bars "
+                    f"(+{TAKE_PROFIT:.2%}/-{STOP_LOSS:.2%}) | precision {prec:.1%} "
+                    f"vs breakeven {breakeven:.1%} on {int(picked.sum()):,} test signals "
+                    f"| EV {ev * 100:+.3f}%/trade")
+        if ev <= 0:
+            logger.warning("[intraday] EXPECTED VALUE IS NEGATIVE - this "
+                           "configuration loses money on backtest")
         self.model = model
         self.positive_rate = float(ytr.mean())
         joblib.dump({'model': model, 'meta': self.last_metrics}, MODEL_PATH)
