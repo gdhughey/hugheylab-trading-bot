@@ -15,7 +15,7 @@ Still paper. Every "trade" is a row in SQLite; no broker is connected.
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from src.intraday_engine import (market_state, minutes_to_close, ET,
                                  is_crypto, asset_class, barriers)
@@ -38,6 +38,33 @@ class FastTrader:
         self.cooldown = {}                # symbol -> datetime it may be re-entered
         self.entry_time = {}              # symbol -> when we opened it
         self.last_summary = {}
+        self._recover_entry_times()
+
+    def _recover_entry_times(self):
+        """Rebuild entry times from the ledger after a restart.
+
+        These lived only in memory, so any position opened before a restart had
+        no entry time and FAST_MAX_HOLD_MIN could never fire for it - the
+        position would sit indefinitely (crypto has no end-of-day backstop).
+        The service restarted four times in two days, so this was live.
+        """
+        try:
+            rows = self.budget.conn.execute(
+                "SELECT symbol, MAX(created_at) AS opened FROM trades "
+                "WHERE status = 'EXECUTED' AND side = 'BUY' GROUP BY symbol").fetchall()
+            held = {p['symbol'] for p in self.budget.get_positions()}
+            for r in rows:
+                if r['symbol'] not in held or not r['opened']:
+                    continue
+                ts = datetime.fromisoformat(r['opened'])
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                self.entry_time[r['symbol']] = ts.astimezone(ET)
+            if self.entry_time:
+                logger.info(f"Recovered entry times for {len(self.entry_time)} "
+                            f"open position(s) from the ledger")
+        except Exception as e:
+            logger.warning(f"Could not recover entry times: {e}")
 
     # --- config ----------------------------------------------------------
     @property
@@ -90,10 +117,15 @@ class FastTrader:
         # per-class, so a losing crypto model no longer drags stocks down with
         # it (or vice versa). Set FAST_IGNORE_EV=1 to override deliberately.
         respect_ev = os.getenv('FAST_IGNORE_EV', '0') not in ('1', 'true', 'yes')
+        # An EV barely above zero is not tradeable: a round trip costs roughly
+        # 5-40 bps on stocks and 22-100+ bps on retail crypto venues, none of
+        # which the backtest models. Require a real margin over costs, not just
+        # a positive sign.
+        min_ev = float(os.getenv('MIN_EV_TO_TRADE', 0.003))
         blocked = set()
         if respect_ev:
             for cls, m in (self.engine.metrics or {}).items():
-                if m.get('ev', 0) <= 0:
+                if m.get('ev', 0) < min_ev:
                     blocked.add(cls)
         summary['blocked_classes'] = sorted(blocked)
 
@@ -178,7 +210,8 @@ class FastTrader:
             if sym in held:
                 continue
             if respect_ev and asset_class(sym) in blocked:
-                summary['skipped'].append((sym, f"{asset_class(sym)} model has negative EV"))
+                summary['skipped'].append(
+                    (sym, f"{asset_class(sym)} EV below the {min_ev:.2%} cost floor"))
                 continue
             if not tradeable(sym):
                 summary['skipped'].append((sym, 'market closed'))

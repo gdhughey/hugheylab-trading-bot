@@ -21,12 +21,12 @@ from dotenv import load_dotenv; load_dotenv()
 
 import numpy as np, pandas as pd, yfinance as yf
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import precision_score
 
-from src.intraday_engine import build_features, FEATURES, DEFAULT_FAST, DEFAULT_CRYPTO
-from src.labeling import triple_barrier, purged_split
+from src.intraday_engine import build_features, FEATURES, DEFAULT_FAST, DEFAULT_CRYPTO, ET
+from src.labeling import triple_barrier, walk_forward
 
-MIN_TEST_SIGNALS = 300      # below this, precision is not measurable
+MIN_TEST_SIGNALS = 300      # pooled across windows; below this, precision is not measurable
+WF_WINDOWS = 4              # consecutive out-of-sample windows per candidate
 
 EXTRA_STOCKS = ['UBER','SHOP','SQ','COIN','MARA','RIOT','DKNG','SNAP','PINS','ROKU',
                 'ZM','DOCU','TWLO','NET','DDOG','SNOW','ABNB','LYFT','CVNA','AFRM',
@@ -53,11 +53,14 @@ def load(symbols, period='60d', interval='5m', chunk=60):
     return out
 
 
-def dataset(data, tp, sl, hz):
+def dataset(data, tp, sl, hz, cls='stock'):
     frames = []
     for s, d in data.items():
         f = build_features(d)
-        f['target'] = triple_barrier(d['high'], d['low'], d['close'], tp, sl, hz)
+        # Stocks are flattened at the bell, so their label stops there too.
+        session = None if cls == 'crypto' else d.index.tz_convert(ET).date
+        f['target'] = triple_barrier(d['high'], d['low'], d['close'], tp, sl, hz,
+                                     session=session)
         f = f.dropna()
         if not f.empty:
             frames.append(f)
@@ -68,25 +71,38 @@ def dataset(data, tp, sl, hz):
 
 
 def score(X, y, params, ratios, tp, sl, hz, n_syms):
-    Xtr, Xte, ytr, yte = purged_split(X, y, 0.2, embargo_bars=hz * max(n_syms, 1))
-    if len(Xtr) < 5000 or ytr.mean() <= 0.02:
+    """Walk-forward score: retrain on each of WF_WINDOWS consecutive windows
+    and pool the out-of-sample signals. A single 80/20 hold-out let one lucky
+    (or leaky) fortnight pick the winner out of 180 candidates."""
+    hits = {r: 0 for r in ratios}; cnt = {r: 0 for r in ratios}
+    per_window = {r: [] for r in ratios}
+    base = rows = None
+    for Xtr, Xte, ytr, yte in walk_forward(X, y, n_windows=WF_WINDOWS, test_size=0.1,
+                                           embargo_bars=hz * max(n_syms, 1)):
+        if len(Xtr) < 5000 or ytr.mean() <= 0.02:
+            continue
+        m = HistGradientBoostingClassifier(random_state=42, **params)
+        m.fit(Xtr, ytr)
+        proba = m.predict_proba(Xte)[:, 1]
+        base = float(ytr.mean()); rows = len(Xtr)
+        for r in ratios:
+            picked = proba >= min(0.95, base * r)
+            n = int(picked.sum())
+            hits[r] += int(yte[picked].sum()); cnt[r] += n
+            per_window[r].append(round(float(yte[picked].mean()), 3) if n else None)
+    if base is None:
         return None
-    m = HistGradientBoostingClassifier(random_state=42, **params)
-    m.fit(Xtr, ytr)
-    proba = m.predict_proba(Xte)[:, 1]
-    base = float(ytr.mean())
     best = None
     for r in ratios:
-        bar = min(0.95, base * r)
-        picked = proba >= bar
-        n = int(picked.sum())
+        n = cnt[r]
         if n < MIN_TEST_SIGNALS:
             continue
-        prec = precision_score(yte, picked, zero_division=0)
+        prec = hits[r] / n
         ev = prec * tp - (1 - prec) * sl
         if best is None or ev > best['ev']:
             best = dict(ev=float(ev), precision=float(prec), signals=n,
-                        ratio=r, bar=float(bar), base=base, rows=len(Xtr))
+                        ratio=r, bar=float(min(0.95, base * r)), base=base, rows=rows,
+                        windows=per_window[r])
     return best
 
 
@@ -126,7 +142,7 @@ def main():
               f"{'rows':>9}{'signals':>9}{'precision':>11}{'EV/trade':>11}")
         best = None
         for tp, sl, hz in BARRIERS:
-            X, y = dataset(data, tp, sl, hz)
+            X, y = dataset(data, tp, sl, hz, cls)
             if X is None:
                 continue
             for params in PARAM_GRID:
@@ -148,6 +164,7 @@ def main():
                   f"/ {best['horizon']*5}min | {best['params']} | ratio {best['ratio']}")
             print(f"    precision {best['precision']:.1%} on {best['signals']:,} signals "
                   f"-> EV {best['ev']*100:+.3f}%/trade")
+            print(f"    per-window precision: {best.get('windows')}")
 
     if results:
         with open(args.out, 'w') as f:

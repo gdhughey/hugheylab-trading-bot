@@ -192,6 +192,49 @@ capped total buy volume for the week and never refunded it, which halts a
 day-trading loop after a handful of round trips: recycling the same $100 ten
 times "spends" $1,000 against a $500 cap despite never risking more than $100.
 
+## ⛔ Read this first: this model has no measured edge
+
+An external review on 2026-09-08 found a **look-ahead leak** that produced every
+impressive number this project previously reported. `build_features()` computed
+
+```python
+prev_close = close.groupby(session).transform('last').shift(1)   # BUG
+```
+
+`transform('last')` stamps every bar with its **own session's final close**, so
+for all but the first bar `gap_open = day_open / today's_final_close - 1`.
+Combined with `from_open`, the model was handed `final_close / current_close` —
+the answer. Permutation importance after the fact: `gap_open` 0.36, `from_open`
+0.28, everything else ≤0.016.
+
+**With the leak removed, on walk-forward validation:**
+
+| | claimed (leaked) | honest |
+|---|---|---|
+| stock | 92.6% precision, EV +1.059%/trade | **31.5%** vs 37.5% break-even, EV **−0.096%** |
+| crypto | 66.0% precision, EV +0.358%/trade | **40.0%** vs 40.0% break-even, EV **+0.000%** |
+
+Against a real round-trip cost of 5–40 bps (stocks) and 22–100+ bps (retail
+crypto), **no configuration in this feature set is profitable.** Both classes are
+auto-blocked by `MIN_EV_TO_TRADE`. The bot runs, scans, and reports — and
+correctly declines to trade.
+
+### The methodological lesson
+
+**Walk-forward validation would NOT have caught this.** The leaky model scored
+88.8–92.9% across six independent windows with a standard deviation of 1.3
+points. A leak is *consistent*, not lucky — cross-validation made the fake number
+look **more** credible, not less. What exposed it was feature-level inspection
+and permutation importance. Suspiciously good results should trigger a leak
+audit before a validation victory lap.
+
+A second, subtler version of the same class of bug was also found: 44% of
+take-profit labels were hit in a **later session**, but the executor flattens
+before the bell — so the model was trained to chase outcomes it is forbidden to
+capture. `triple_barrier(..., session=...)` now stops the forward walk at the
+session boundary for stocks (crypto, which holds overnight, runs the full
+horizon).
+
 ## Honest performance note
 
 On 181,641 rows the model scores **0.524 holdout accuracy against a 0.510

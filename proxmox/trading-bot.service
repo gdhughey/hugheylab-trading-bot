@@ -8,8 +8,16 @@ Type=simple
 WorkingDirectory=/opt/trading-bot
 EnvironmentFile=/opt/trading-bot/.env
 ExecStart=/opt/trading-bot/venv/bin/python /opt/trading-bot/main.py
-Restart=on-failure
+Restart=always
 RestartSec=15
+
+# The process was OOM-killed on 2026-09-07 after ~12 hours of memory thrashing
+# during which it stopped trading entirely but still looked "active" to systemd.
+# A hard cap makes that failure fast and loud (OOM -> restart) instead of a
+# silent multi-hour stall, and Restart=always covers a clean exit too.
+MemoryMax=700M
+MemoryHigh=600M
+OOMPolicy=kill
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=trading-bot

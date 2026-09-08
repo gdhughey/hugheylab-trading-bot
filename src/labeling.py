@@ -27,11 +27,22 @@ import numpy as np
 import pandas as pd
 
 
-def triple_barrier(high, low, close, take_profit, stop_loss, horizon):
+def triple_barrier(high, low, close, take_profit, stop_loss, horizon,
+                   session=None):
     """Label each bar by which barrier its forward path touches first.
 
     Uses the bar HIGH/LOW, not just closes: a trade is stopped or filled
     intrabar in reality, and pretending otherwise flatters the backtest.
+
+    `session`, if given, is an array of session ids (e.g. the ET date) aligned
+    to `close`. The forward walk then STOPS at the session boundary and an
+    unresolved trade counts as 0. This matters for stocks: the executor
+    flattens before the bell (FAST_EOD_FLATTEN_MIN), so a take-profit that
+    only arrives tomorrow morning is not a trade it can win. Measured on
+    2026-09-08: 61% of 48-bar windows crossed the close and 44% of all
+    take-profit labels were hit in a LATER session - the unbounded label was
+    teaching the model to chase outcomes the execution rules cannot capture,
+    the exact failure this module's docstring warns about.
 
     Returns a Series of {1, 0} aligned to `close`, with NaN where the forward
     window runs off the end of the data.
@@ -40,6 +51,7 @@ def triple_barrier(high, low, close, take_profit, stop_loss, horizon):
     c = close.to_numpy(dtype=float)
     h = high.to_numpy(dtype=float)
     l = low.to_numpy(dtype=float)
+    sess = None if session is None else np.asarray(session)
     out = np.full(n, np.nan)
 
     for i in range(n - horizon):
@@ -50,6 +62,8 @@ def triple_barrier(high, low, close, take_profit, stop_loss, horizon):
         dn = entry * (1.0 - stop_loss)
         label = 0.0
         for j in range(i + 1, i + horizon + 1):
+            if sess is not None and sess[j] != sess[i]:
+                break            # session closed with the trade unresolved
             hit_up = h[j] >= up
             hit_dn = l[j] <= dn
             if hit_up and hit_dn:
@@ -72,6 +86,30 @@ def fixed_horizon(close, threshold, horizon):
     """The naive path-blind label, kept for comparison."""
     fwd = close.shift(-horizon) / close - 1
     return (fwd > threshold).astype(float).where(fwd.notna())
+
+
+def walk_forward(X, y, n_windows=4, test_size=0.1, embargo_bars=0):
+    """Yield (Xtr, Xte, ytr, yte) for consecutive test blocks, expanding train.
+
+    One chronological hold-out is ONE sample of the model's performance, and a
+    number picked because it was the best of many configs on that one sample
+    is not an estimate of anything. Rolling the split forward and retraining
+    each step gives several independent test periods; report the precision
+    pooled across them and look at the spread. Each step purges the last
+    `embargo_bars` rows before its test block, as purged_split does.
+    """
+    n = len(X)
+    block = int(n * test_size)
+    if n_windows < 1 or block < 1:
+        return
+    for k in range(n_windows, 0, -1):
+        cut = n - k * block
+        end = n - (k - 1) * block
+        train_end = max(0, cut - embargo_bars)
+        if train_end < 1:
+            continue
+        yield (X.iloc[:train_end], X.iloc[cut:end],
+               y.iloc[:train_end], y.iloc[cut:end])
 
 
 def purged_split(X, y, test_size=0.2, embargo_bars=0):

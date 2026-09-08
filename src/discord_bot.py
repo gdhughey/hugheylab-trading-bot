@@ -222,6 +222,8 @@ class TradingBot(commands.Cog):
                 if fetch:
                     await asyncio.to_thread(
                         self.engine.fetch_and_store_data, await self._symbols())
+                if self.intraday:
+                    await asyncio.to_thread(self.intraday.full_fetch)
                 ok = await asyncio.to_thread(self.engine.train_model)
                 m = self.engine.last_metrics
                 if ok and m:
@@ -414,7 +416,7 @@ class TradingBot(commands.Cog):
                 logger.error("❌ Model training failed")
             if self.fast_mode:
                 logger.info("⚡ FAST MODE - preparing intraday model...")
-                await asyncio.to_thread(self.intraday.fetch)
+                await asyncio.to_thread(self.intraday.full_fetch)
                 if await asyncio.to_thread(self.intraday.train):
                     for cls, m in sorted((self.intraday.metrics or {}).items()):
                         verdict = "tradeable" if m['ev'] > 0 else "NEGATIVE EV - will not trade"
@@ -585,13 +587,19 @@ class TradingBot(commands.Cog):
         every FAST_SUMMARY_MINUTES, so a 60s loop doesn't spam the channel."""
         if self.warming_up or not self.fast:
             return
-        channel = await self._destination()
-        if not channel:
-            return
+        # Run the trading cycle FIRST. Resolving the Discord channel before this
+        # meant a DM/API failure silently stopped every stop-loss and every
+        # end-of-day flatten - reporting must never gate risk management.
         try:
             summary = await asyncio.to_thread(self.fast.cycle)
-        except Exception as e:
+        except Exception:
             logger.exception("fast cycle failed")
+            return
+        channel = await self._destination()
+        if not channel:
+            if summary['entries'] or summary['exits']:
+                logger.warning("Traded but could not reach Discord to report: "
+                               f"{len(summary['entries'])} in, {len(summary['exits'])} out")
             return
 
         acted = summary['entries'] or summary['exits']

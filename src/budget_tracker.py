@@ -187,8 +187,13 @@ class BudgetTracker:
             {
                 'symbol': r['symbol'],
                 'shares': r['shares'],
-                'avg_price': round(r['avg_price'], 2),
-                'cost_basis': round(r['shares'] * r['avg_price'], 2),
+                # NOT rounded: FastTrader computes stop-loss and take-profit
+                # against this value, so rounding to cents moved the executed
+                # barriers away from the trained ones. On sub-$1 crypto the
+                # error reached 5% of entry - a "take profit" could fire at a
+                # real loss. Round for display only, never for arithmetic.
+                'avg_price': float(r['avg_price']),
+                'cost_basis': float(r['shares'] * r['avg_price']),
                 'updated_at': r['updated_at'],
             }
             for r in rows

@@ -14,7 +14,7 @@ Deliberately narrow: a small, liquid universe so a full refresh takes seconds.
 import os
 import json
 import logging
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -26,7 +26,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, precision_score
 
 from src.database import connect
-from src.labeling import triple_barrier, fixed_horizon, purged_split
+from src.labeling import triple_barrier, fixed_horizon, purged_split, walk_forward
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,17 @@ def fast_universe():
 
 # --- market hours ---------------------------------------------------------
 
+# US market holidays. A hardcoded list is not enough on its own (it goes stale,
+# and misses half-days and data outages), so it is paired with the freshness
+# check below - that catches everything, including the Labor Day 2026 incident
+# where the bot traded on Friday's prices.
+US_HOLIDAYS_2026 = {
+    '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
+    '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+}
+EARLY_CLOSE_2026 = {'2026-11-27', '2026-12-24'}   # 13:00 ET
+
+
 def market_state(now=None, symbol=None):
     """('open'|'premarket'|'afterhours'|'closed', description).
 
@@ -154,9 +165,13 @@ def market_state(now=None, symbol=None):
     now = (now or datetime.now(ET)).astimezone(ET)
     if now.weekday() >= 5:
         return 'closed', 'weekend'
+    day = now.strftime('%Y-%m-%d')
+    if day in US_HOLIDAYS_2026:
+        return 'closed', 'market holiday'
     t = now.time()
-    if dtime(9, 30) <= t < dtime(16, 0):
-        return 'open', 'regular session'
+    close = dtime(13, 0) if day in EARLY_CLOSE_2026 else dtime(16, 0)
+    if dtime(9, 30) <= t < close:
+        return 'open', 'early close 13:00 ET' if day in EARLY_CLOSE_2026 else 'regular session'
     if dtime(4, 0) <= t < dtime(9, 30):
         return 'premarket', 'pre-market'
     if dtime(16, 0) <= t < dtime(20, 0):
@@ -166,7 +181,8 @@ def market_state(now=None, symbol=None):
 
 def minutes_to_close(now=None):
     now = (now or datetime.now(ET)).astimezone(ET)
-    close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    hour = 13 if now.strftime('%Y-%m-%d') in EARLY_CLOSE_2026 else 16
+    close = now.replace(hour=hour, minute=0, second=0, microsecond=0)
     return (close - now).total_seconds() / 60
 
 
@@ -208,7 +224,18 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     mins = df.index.tz_convert(ET)
     out['minutes_norm'] = ((mins.hour * 60 + mins.minute) - 570) / 390.0  # 9:30->0, 16:00->1
 
-    prev_close = close.groupby(session).transform('last').shift(1)
+    # LOOK-AHEAD LEAK FIXED 2026-09-08. The previous version was:
+    #     prev_close = close.groupby(session).transform('last').shift(1)
+    # transform('last') stamps every bar with its OWN session's final close, so
+    # for every bar after the first, gap_open was day_open / today's_close - 1.
+    # Paired with from_open (= close/day_open - 1) the model was handed
+    # final_close / current_close: the answer. It scored 92.6% precision in
+    # backtest and fired on 0 of 73,316 rows at live inference, because at the
+    # last bar "the session's final close" IS the current close.
+    # Correct version: the PREVIOUS session's last close, mapped back by session.
+    session_last = close.groupby(session).last()
+    prev_session_last = session_last.shift(1)
+    prev_close = pd.Series(session, index=close.index).map(prev_session_last)
     out['gap_open'] = (day_open / prev_close - 1).fillna(0)
     return out
 
@@ -224,7 +251,13 @@ def build_target(df: pd.DataFrame, cls: str = 'stock') -> pd.Series:
     tp, sl, hz = barriers(cls)
     if os.getenv('LABEL_MODE', 'triple') == 'fixed':
         return fixed_horizon(df['close'], THRESHOLD, hz)
-    return triple_barrier(df['high'], df['low'], df['close'], tp, sl, hz)
+    # Stocks are flattened before the bell (FastTrader.eod_flatten_min), so the
+    # label must stop at the session close too - otherwise it rewards
+    # take-profits that only arrive next morning, which the executor never
+    # sees. Crypto is held overnight, so its path runs the full horizon.
+    session = None if cls == 'crypto' else df.index.tz_convert(ET).date
+    return triple_barrier(df['high'], df['low'], df['close'], tp, sl, hz,
+                          session=session)
 
 
 class IntradayEngine:
@@ -288,9 +321,19 @@ class IntradayEngine:
     # --- data ------------------------------------------------------------
 
     def fetch(self, symbols=None, interval=None, period=None) -> int:
+        """Download bars and upsert them.
+
+        `period` defaults to a SHORT window: the 60s trading loop only needs the
+        newest bars, and re-downloading 60 days x 93 symbols every minute is
+        what OOM-killed this process on 2026-09-07 (12 hours frozen, no exits,
+        no alerts). Training explicitly asks for the full history instead.
+        """
         symbols = symbols or self.symbols
         interval = interval or INTERVAL
-        period = period or (('7d' if interval == '1m' else PERIOD))
+        if period is None:
+            period = os.getenv('INTRADAY_REFRESH_PERIOD', '5d')
+            if interval == '1m':
+                period = min(period, '7d')
         try:
             raw = yf.download(symbols, period=period, interval=interval,
                               auto_adjust=True, progress=False,
@@ -324,11 +367,29 @@ class IntradayEngine:
                 continue
         return total
 
-    def _history(self, symbol, interval=None) -> pd.DataFrame:
-        df = pd.read_sql_query(
-            "SELECT ts, open, high, low, close, volume FROM prices_intraday "
-            "WHERE symbol = ? AND interval = ? ORDER BY ts",
-            self.conn, params=(symbol, interval or INTERVAL))
+    def full_fetch(self, symbols=None, interval=None):
+        """Pull the complete history. Used for training, never in the loop."""
+        return self.fetch(symbols, interval, period=PERIOD)
+
+    def _history(self, symbol, interval=None, limit=None) -> pd.DataFrame:
+        """Bars for one symbol, newest `limit` if given.
+
+        Scoring only needs enough history for the longest feature lookback
+        (20-bar volume mean) plus the current session for the VWAP/day-range
+        groupbys. Loading all ~17k stored bars per symbol just to read the last
+        row was the other half of the memory blow-up.
+        """
+        if limit:
+            df = pd.read_sql_query(
+                "SELECT * FROM (SELECT ts, open, high, low, close, volume "
+                "FROM prices_intraday WHERE symbol = ? AND interval = ? "
+                "ORDER BY ts DESC LIMIT ?) ORDER BY ts",
+                self.conn, params=(symbol, interval or INTERVAL, int(limit)))
+        else:
+            df = pd.read_sql_query(
+                "SELECT ts, open, high, low, close, volume FROM prices_intraday "
+                "WHERE symbol = ? AND interval = ? ORDER BY ts",
+                self.conn, params=(symbol, interval or INTERVAL))
         if df.empty:
             return df
         df['ts'] = pd.to_datetime(df['ts'], utc=True, format='ISO8601')
@@ -381,6 +442,31 @@ class IntradayEngine:
             picked = model.predict_proba(Xte)[:, 1] >= bar
             prec = float(precision_score(yte, picked, zero_division=0)) if picked.sum() else 0.0
             breakeven = sl / (tp + sl)
+            holdout_prec, holdout_n = prec, int(picked.sum())
+
+            # Walk-forward: the single hold-out above is ONE sample, and the
+            # barriers/params/ratio in tuned.json were chosen because they won
+            # on that very sample. Re-fit on several consecutive windows and
+            # pool the out-of-sample signals; THAT precision drives the EV gate.
+            wf_prec, wf_n, wf_hits = [], [], 0
+            n_wf = int(os.getenv('INTRADAY_WF_WINDOWS', 4))
+            for Xa, Xb, ya, yb in walk_forward(X, y, n_windows=n_wf, test_size=0.1,
+                                               embargo_bars=hz * max(n_syms, 1)):
+                if len(Xa) < 1000 or ya.mean() <= 0.01:
+                    continue
+                m = HistGradientBoostingClassifier(random_state=42,
+                                                   **model_params(cls)).fit(Xa, ya)
+                pk = m.predict_proba(Xb)[:, 1] >= min(0.95, float(ya.mean()) * prob_ratio(cls))
+                k = int(pk.sum())
+                wf_n.append(k)
+                wf_prec.append(float(yb[pk].mean()) if k else None)
+                wf_hits += int(yb[pk].sum())
+            if wf_n:
+                total = sum(wf_n)
+                prec = wf_hits / total if total else 0.0
+                n_signals = total
+            else:
+                n_signals = holdout_n
             ev = prec * tp - (1 - prec) * sl
 
             self.models[cls] = model
@@ -392,14 +478,19 @@ class IntradayEngine:
                 'interval': INTERVAL, 'horizon_bars': hz,
                 'take_profit': tp, 'stop_loss': sl,
                 'precision': prec, 'breakeven': breakeven, 'ev': ev,
-                'test_signals': int(picked.sum()), 'bar': bar,
+                'test_signals': int(n_signals), 'bar': bar,
+                'holdout_precision': holdout_prec, 'holdout_signals': holdout_n,
+                'wf_windows': len(wf_n), 'wf_signals': wf_n,
+                'wf_precision': wf_prec,
             }
             trained_any = True
             verdict = "profitable" if ev > 0 else "LOSES MONEY"
             logger.info(f"[intraday/{cls}] {n_syms} symbols, {len(Xtr):,} rows | "
-                        f"precision {prec:.1%} vs breakeven {breakeven:.1%} on "
-                        f"{int(picked.sum()):,} signals | EV {ev * 100:+.3f}%/trade "
-                        f"({verdict}) | bar p>{bar:.3f}")
+                        f"walk-forward precision {prec:.1%} vs breakeven "
+                        f"{breakeven:.1%} on {int(n_signals):,} signals over "
+                        f"{len(wf_n)} windows {[None if p is None else round(p, 3) for p in wf_prec]} "
+                        f"| EV {ev * 100:+.3f}%/trade ({verdict}) | bar p>{bar:.3f} "
+                        f"| single hold-out {holdout_prec:.1%} on {holdout_n:,}")
             if ev <= 0:
                 logger.warning(f"[intraday/{cls}] NEGATIVE EXPECTED VALUE - this "
                                f"asset class is not tradeable on these barriers")
@@ -418,12 +509,23 @@ class IntradayEngine:
         model = self.models.get(cls)
         if model is None:
             return None
-        h = self._history(symbol)
+        h = self._history(symbol, limit=int(os.getenv('SIGNAL_BARS', 400)))
         if len(h) < 60:
             return None
         f = build_features(h).replace([np.inf, -np.inf], np.nan).dropna()
         if f.empty:
             return None
+        # Refuse to act on stale bars. This is the general form of the holiday
+        # bug: on 2026-09-07 the bot entered three positions using the previous
+        # Friday's bars because nothing checked how old they were.
+        age_min = (datetime.now(timezone.utc) - h.index[-1].to_pydatetime()
+                   ).total_seconds() / 60
+        max_age = float(os.getenv('MAX_BAR_AGE_MIN', 45))
+        if age_min > max_age:
+            logger.debug(f"{symbol}: newest bar is {age_min:.0f} min old "
+                         f"(limit {max_age:.0f}) - not scoring")
+            return None
+
         p_up = float(model.predict_proba(f[FEATURES].iloc[[-1]])[0][1])
         return {
             'symbol': symbol,
@@ -432,6 +534,7 @@ class IntradayEngine:
             'bar': self.threshold(cls),
             'price': float(h['close'].iloc[-1]),
             'bar_time': h.index[-1].astimezone(ET).strftime('%H:%M ET'),
+            'bar_age_min': age_min,
         }
 
     def scan(self, min_probability=None):
