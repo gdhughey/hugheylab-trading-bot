@@ -419,7 +419,14 @@ class TradingBot(commands.Cog):
                 await asyncio.to_thread(self.intraday.full_fetch)
                 if await asyncio.to_thread(self.intraday.train):
                     for cls, m in sorted((self.intraday.metrics or {}).items()):
-                        verdict = "tradeable" if m['ev'] > 0 else "NEGATIVE EV - will not trade"
+                        _floor = float(os.getenv('MIN_EV_TO_TRADE', 0.003))
+                        if m['ev'] >= _floor:
+                            verdict = "tradeable"
+                        elif m['ev'] > 0:
+                            verdict = (f"EV +{m['ev'] * 100:.3f}% is under the "
+                                       f"{_floor:.2%} cost floor - will not trade")
+                        else:
+                            verdict = "NEGATIVE EV - will not trade"
                         logger.info(f"⚡ {cls} model ready: precision "
                                     f"{m['precision']:.1%} vs breakeven "
                                     f"{m['breakeven']:.1%}, EV {m['ev'] * 100:+.3f}%/trade "
@@ -437,6 +444,79 @@ class TradingBot(commands.Cog):
         finally:
             self.warming_up = False
             logger.info("🟢 Ready - slash commands are live")
+            try:
+                await self._send_startup_notice()
+            except Exception as e:
+                logger.error(f"startup notice failed: {e}")
+
+    async def _send_startup_notice(self):
+        """Post exactly one message on startup saying whether the bot will
+        trade and, if not, why.
+
+        Routine chatter is off (HEARTBEAT=0, FAST_SUMMARY_MINUTES=0), so the
+        channel is silent unless a trade happens. That makes a dead process and
+        a deliberately idle one look identical. This notice is the one message
+        that distinguishes them: it fires on every restart, and it names the
+        gate that is blocking each asset class.
+        """
+        if os.getenv('STARTUP_NOTICE', '1') in ('0', 'false', 'no'):
+            return
+        channel = await self._destination()
+        if not channel:
+            return
+
+        floor = float(os.getenv('MIN_EV_TO_TRADE', 0.003))
+        metrics = (self.intraday.metrics or {}) if self.fast_mode else {}
+        will_trade = [c for c, m in metrics.items() if m['ev'] >= floor]
+
+        e = discord.Embed(
+            title="🔄 Trading bot restarted",
+            description=("**Trading is LIVE** - you will hear from me when I buy or sell."
+                         if will_trade else
+                         "**Nothing will be traded right now.** Every asset class is "
+                         "below the cost floor, so the bot is watching only. "
+                         "This is the risk gate working, not a crash."),
+            color=discord.Color.green() if will_trade else discord.Color.orange(),
+            timestamp=datetime.now().astimezone())
+
+        for cls, m in sorted(metrics.items()):
+            if m['ev'] >= floor:
+                verdict = f"✅ **Trading.** Edge clears the {floor:.2%} cost floor."
+            elif m['ev'] > 0:
+                verdict = (f"⛔ **Not trading.** Edge of {m['ev'] * 100:+.3f}% per trade "
+                           f"is real but smaller than the {floor:.2%} it costs to get "
+                           f"in and out, so it would lose money after fees.")
+            else:
+                verdict = (f"⛔ **Not trading.** Model loses money "
+                           f"({m['ev'] * 100:+.3f}% per trade) on these settings.")
+            e.add_field(
+                name=f"{cls.title()}",
+                value=(f"{verdict}\n"
+                       f"Gets it right {m['precision']:.1%} of the time; needs "
+                       f"{m['breakeven']:.1%} just to break even."),
+                inline=False)
+
+        if not metrics:
+            e.add_field(name="Models",
+                        value="No intraday model is loaded - fast mode is off.",
+                        inline=False)
+
+        try:
+            held = self.budget_tracker.get_positions()
+            e.add_field(
+                name="Open paper positions",
+                value=("none" if not held else
+                       ", ".join(f"{p['shares']} {p['symbol']}" for p in held)),
+                inline=True)
+            e.add_field(name="Cash left",
+                        value=f"${self.budget_tracker.get_remaining_budget():,.2f}",
+                        inline=True)
+        except Exception:
+            pass
+
+        e.set_footer(text="Quiet mode: no routine updates. You only hear from me "
+                          "when I trade, or when I restart. PAPER TRADING.")
+        await channel.send(embed=e)
     
     async def _destination(self):
         """Where alerts go: your DM by default, a guild channel if CHANNEL_ID is set.
@@ -604,8 +684,11 @@ class TradingBot(commands.Cog):
 
         acted = summary['entries'] or summary['exits']
         gap = float(os.getenv('FAST_SUMMARY_MINUTES', 30))
-        due = (self._last_fast_summary is None or
-               (datetime.now() - self._last_fast_summary).total_seconds() / 60 >= gap)
+        # 0 (or less) disables the idle summary entirely: report only when the
+        # bot actually did something. Without this guard a gap of 0 makes every
+        # single 60s cycle "due" and floods the channel.
+        due = gap > 0 and (self._last_fast_summary is None or
+                           (datetime.now() - self._last_fast_summary).total_seconds() / 60 >= gap)
 
         if acted:
             try:

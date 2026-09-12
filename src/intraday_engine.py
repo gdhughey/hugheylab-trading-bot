@@ -95,7 +95,7 @@ DEFAULT_FAST = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'GOOGL', 'META', 'AMD',
                 # EV +1.057%/trade against +0.278%. More symbols is the cheapest
                 # real gain available - 5m history is capped at 60 days, so
                 # breadth is the only way to add data.
-                'UBER', 'SHOP', 'SQ', 'COIN', 'MARA', 'RIOT', 'DKNG', 'SNAP',
+                'UBER', 'SHOP', 'XYZ', 'COIN', 'MARA', 'RIOT', 'DKNG', 'SNAP',
                 'PINS', 'ROKU', 'ZM', 'DOCU', 'TWLO', 'NET', 'DDOG', 'SNOW',
                 'ABNB', 'LYFT', 'CVNA', 'AFRM', 'UPST', 'PATH', 'U', 'RBLX',
                 'TTD', 'ETSY', 'EBAY', 'PYPL', 'V', 'MA', 'JPM', 'GS', 'MS',
