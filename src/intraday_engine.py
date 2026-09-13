@@ -175,7 +175,11 @@ def next_trading_day_open(ts: datetime) -> datetime:
     taken, because a Monday-evening SELL logged as Tuesday 02:00 UTC still
     settles Tuesday, not Wednesday (T+1 for a cash account). Returns a
     tz-aware ET datetime; callers that store it convert to UTC ISO themselves.
+    A naive ts raises ValueError: astimezone() would read it as system-local
+    time and silently produce a plausible-looking wrong settlement date.
     """
+    if ts.tzinfo is None or ts.utcoffset() is None:
+        raise ValueError('next_trading_day_open needs a tz-aware datetime')
     d = ts.astimezone(ET).date() + timedelta(days=1)
     while not is_trading_day(d):
         d += timedelta(days=1)

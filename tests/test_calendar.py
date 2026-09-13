@@ -106,3 +106,10 @@ def test_result_is_tz_aware_et():
     # EDT on 09-21: the UTC rendering Task 4 stores must be 13:30Z
     assert got.astimezone(timezone.utc) == datetime(2026, 9, 21, 13, 30, tzinfo=timezone.utc)
     assert got.utcoffset() == timedelta(hours=-4)
+
+
+def test_naive_datetime_is_rejected():
+    # A naive value would be read as system-local time (CST/CDT on LXC 200) and
+    # silently land an evening SELL on the wrong settlement date. Fail loud.
+    with pytest.raises(ValueError):
+        next_trading_day_open(datetime(2026, 9, 18, 15, 55))
