@@ -262,6 +262,131 @@ def test_manual_sell_approved_after_auto_exit_is_rejected(bt):
     assert [r['id'] for r in bt.get_trades_since_open()] == [buy['id'], auto['id']]
 
 
+@pytest.mark.parametrize('qty', [0.0, -1.0, 1e-9])
+def test_log_trade_rejects_non_positive_qty(bt, qty):
+    # A negative-qty BUY would produce a negative amount and CREDIT cash on
+    # execute; a zero-qty trade would write a 0-share position row. Neither
+    # may reach the ledger.
+    with pytest.raises(ValueError, match='qty'):
+        bt.log_trade('AAPL', 'BUY', 100.0, qty, now=FRI_1000)
+    assert bt.get_cash() == 500.0
+    assert bt.conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()['n'] == 0
+
+
+@pytest.mark.parametrize('ref', [0.0, -100.0])
+def test_log_trade_rejects_non_positive_ref_price(bt, ref):
+    with pytest.raises(ValueError, match='ref_price'):
+        bt.log_trade('AAPL', 'BUY', ref, 1.0, now=FRI_1000)
+    assert bt.conn.execute("SELECT COUNT(*) AS n FROM trades").fetchone()['n'] == 0
+
+
+def _fill_three_slots(bt):
+    """Three $125 BUYs from $500: buying power is then the last ~$125."""
+    for sym in ('AAPL', 'MSFT', 'NVDA'):
+        qty, _, _ = bt.size_order(sym, 100.0, now=FRI_1000)
+        _round_trip(bt, sym, 'BUY', 100.0, qty, FRI_1000)
+    bp = bt.get_buying_power(now=FRI_1000)
+    assert bp == pytest.approx(125.0, abs=1e-3)
+    return bp
+
+
+def _assert_rejected(bt, tid, now):
+    row = bt.conn.execute("SELECT * FROM trades WHERE id = ?", (tid,)).fetchone()
+    assert row['status'] == 'REJECTED'
+    assert row['settled_at'] == now.isoformat(timespec='seconds')
+
+
+def test_buy_that_exceeds_buying_power_at_execution_is_rejected(bt):
+    # The fast cycle and a Discord /buy can both call size_order before either
+    # logs its trade, so both are told the same (last) $125. The fast cycle
+    # logs and fills at once; the /buy is logged after and approved later.
+    # Its fill must be refused inside the transaction, not overdraw cash.
+    _fill_three_slots(bt)
+    qty_a, size_a, _ = bt.size_order('AMD', 100.0, now=FRI_1000)
+    qty_b, size_b, _ = bt.size_order('TSLA', 100.0, now=FRI_1000)
+    assert size_a == pytest.approx(size_b)
+    fast = _round_trip(bt, 'AMD', 'BUY', 100.0, qty_a, FRI_1000)
+    assert fast['status'] == 'EXECUTED'
+    cash_after = bt.get_cash()
+    assert cash_after == pytest.approx(0.0, abs=1e-3)
+    manual = bt.log_trade('TSLA', 'BUY', 100.0, qty_b, now=FRI_1000)
+    assert bt.execute_trade(manual, now=FRI_1555) is None
+    _assert_rejected(bt, manual, FRI_1555)
+    assert bt.get_cash() == pytest.approx(cash_after)
+    assert bt.get_cash() >= -1e-3
+    assert [p['symbol'] for p in bt.get_positions()] == ['AAPL', 'AMD', 'MSFT', 'NVDA']
+    assert bt.get_buying_power(now=FRI_1555) == pytest.approx(0.0, abs=1e-3)   # hold released
+    assert [r['symbol'] for r in bt.get_trades_since_open()] == ['AAPL', 'MSFT', 'NVDA', 'AMD']
+
+
+def test_pending_buy_hold_is_a_reservation_the_later_buy_must_respect(bt):
+    # Both BUYs are PENDING before either fills (a /buy awaiting approval and
+    # a fast-cycle entry sized in the same window). A PENDING hold reserves
+    # buying power for its own fill and for nothing else: whichever is
+    # executed first must not spend the other's reservation. Exactly one
+    # fills and cash never goes negative.
+    _fill_three_slots(bt)
+    qty_a, _, _ = bt.size_order('AMD', 100.0, now=FRI_1000)
+    qty_b, _, _ = bt.size_order('TSLA', 100.0, now=FRI_1000)
+    first = bt.log_trade('AMD', 'BUY', 100.0, qty_a, now=FRI_1000)
+    second = bt.log_trade('TSLA', 'BUY', 100.0, qty_b, now=FRI_1000)
+    assert bt.get_buying_power(now=FRI_1000) == 0.0            # both holds taken
+    assert bt.execute_trade(first, now=FRI_1000) is None       # second's hold reserves the cash
+    _assert_rejected(bt, first, FRI_1000)
+    assert bt.get_cash() == pytest.approx(125.0, abs=1e-3)     # nothing moved
+    filled = bt.execute_trade(second, now=FRI_1000)
+    assert filled['status'] == 'EXECUTED'
+    assert bt.get_cash() == pytest.approx(0.0, abs=1e-3)
+    assert bt.get_cash() >= -1e-3
+    assert [p['symbol'] for p in bt.get_positions()] == ['AAPL', 'MSFT', 'NVDA', 'TSLA']
+
+
+def test_buy_sized_before_a_sell_settles_is_rejected_in_a_cash_account(bt):
+    # Unsettled proceeds are cash but not buying power. A BUY logged against
+    # them (a /buy typed with a bigger qty than size_order allows) is refused
+    # at fill even though cash would cover it.
+    _round_trip(bt, 'AAPL', 'BUY', 100.0, 4.0, FRI_1000)
+    _round_trip(bt, 'AAPL', 'SELL', 100.0, 4.0, FRI_1555, exit_reason='eod')
+    assert bt.get_cash() > 490.0
+    assert bt.get_buying_power(now=FRI_1555) == pytest.approx(500.0 - 4 * 100.05)   # $99.80 that never left
+    cash = bt.get_cash()
+    tid = bt.log_trade('MSFT', 'BUY', 100.0, 2.0, now=FRI_1555)     # ~$200 > ~$100 buying power
+    assert bt.execute_trade(tid, now=FRI_1555) is None
+    _assert_rejected(bt, tid, FRI_1555)
+    assert bt.get_cash() == pytest.approx(cash)
+    assert bt.get_positions() == []
+    # Monday the proceeds have settled and the same order fills
+    tid = bt.log_trade('MSFT', 'BUY', 100.0, 2.0, now=MON_0930)
+    assert bt.execute_trade(tid, now=MON_0930)['status'] == 'EXECUTED'
+
+
+def test_buy_sized_at_full_buying_power_fills_despite_qty_rounding(bt):
+    # size_order rounds qty to 6 dp, which on a high-priced asset can push the
+    # debit a few cents over buying power (the "6-dp qty rounding aside" in
+    # its docstring). That slack belongs to sizing, not the caller: the guard
+    # must not reject the very order size_order produced.
+    for sym in ('AAPL', 'MSFT', 'NVDA'):
+        qty, _, _ = bt.size_order(sym, 100.0, now=FRI_1000)
+        _round_trip(bt, sym, 'BUY', 100.0, qty, FRI_1000)
+    bp = bt.get_buying_power(now=FRI_1000)
+    qty, size_usd, est_fill = bt.size_order('BTC-USD', 100_000.0, now=FRI_1000)
+    assert size_usd == pytest.approx(125.0)
+    assert qty == 0.001243                                  # 125 / 100600 = 0.0012425.. rounds UP
+    over = qty * est_fill - bp
+    assert 0 < over < 0.5e-6 * est_fill                     # a few cents, inside one 6-dp step
+    # two 6-dp steps more is the caller's overreach, not rounding: rejected
+    too_big = bt.log_trade('BTC-USD', 'BUY', 100_000.0, round(qty + 2e-6, 6), now=FRI_1000)
+    assert bt.execute_trade(too_big, now=FRI_1000) is None
+    assert bt.get_cash() == pytest.approx(bp)
+    # the sized order itself fills
+    tid = bt.log_trade('BTC-USD', 'BUY', 100_000.0, qty, now=FRI_1000)
+    row = bt.execute_trade(tid, now=FRI_1000)
+    assert row['status'] == 'EXECUTED'
+    assert row['amount'] == pytest.approx(bp + over)
+    assert bt.get_cash() == pytest.approx(-over)            # the documented rounding slack, nothing more
+    assert len(bt.get_positions()) == 4
+
+
 def test_sell_of_more_than_held_is_capped_to_the_position(bt):
     buy = _round_trip(bt, 'AAPL', 'BUY', 100.0, 1.0, FRI_1000)
     tid = bt.log_trade('AAPL', 'SELL', 100.0, 3.0, exit_reason='manual', now=FRI_1555)
@@ -393,6 +518,32 @@ def test_get_pnl_keys_and_equity(bt):
     assert pnl['total'] == pytest.approx(pnl['unrealized'])
     assert [p['symbol'] for p in pnl['positions']] == ['AAPL', 'MSFT']
     assert pnl['positions'][1]['price'] is None and pnl['positions'][1]['pnl'] is None
+
+
+def test_nan_quote_is_treated_as_missing_everywhere(bt):
+    # A data gap that has been through pandas arrives as NaN, not None. NaN is
+    # not None, so without care it propagates: equity becomes nan, and
+    # min(buying_power, nan) keeps buying_power, sizing the whole account into
+    # one slot. The ledger must take the avg_price / stale path for NaN too.
+    nan = float('nan')
+    buy = _round_trip(bt, 'AAPL', 'BUY', 100.0, 1.0, FRI_1000)
+    cash = bt.get_cash()
+    carried = cash + 1.0 * 100.05
+    assert bt.get_equity({'AAPL': nan}) == pytest.approx(carried)
+    assert bt.get_equity({'AAPL': None}) == pytest.approx(carried)
+    qty, size_usd, est_fill = bt.size_order('MSFT', 100.0, prices={'AAPL': nan}, now=FRI_1000)
+    assert size_usd == pytest.approx(carried / 4)           # the equity slice, not all of buying power
+    assert size_usd < bt.get_buying_power(now=FRI_1000)
+    assert qty == round(size_usd / est_fill, 6)
+    pnl = bt.get_pnl({'AAPL': nan}.get)
+    assert pnl['stale'] == ['AAPL']
+    assert pnl['positions'][0]['price'] is None and pnl['positions'][0]['pnl'] is None
+    assert pnl['unrealized'] == 0.0 and pnl['market_value'] == 0.0
+    assert pnl['equity'] == pytest.approx(carried)
+    assert pnl['all_time_net'] == pytest.approx(carried - 500.0)
+    snap = bt.record_equity('2026-09-18', {'AAPL': nan}, now=FRI_1600)
+    assert snap['positions_value'] == pytest.approx(buy['amount'])
+    assert snap['equity'] == pytest.approx(carried)
 
 
 # --- day state / equity history -----------------------------------------------

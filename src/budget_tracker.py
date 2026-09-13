@@ -21,10 +21,16 @@ Account semantics:
     execute_trade re-runs it only when it must cap a SELL at the held qty.
   * A SELL can never credit more than the position it closes: an oversized
     SELL is capped to the held shares and one against a flat position is
-    REJECTED, so cash + positions never lie about each other.
+    REJECTED. A BUY can never spend more than buying power: execute_trade
+    re-checks it inside the transaction (a PENDING hold is only a
+    reservation; the ledger at fill time is the authority) and REJECTS an
+    over-committed BUY. So cash + positions never lie about each other.
   * Every mutating method takes one threading.Lock and runs inside a single
-    BEGIN IMMEDIATE transaction, so a buying-power check and the cash debit
+    BEGIN IMMEDIATE transaction, so the buying-power check and the cash debit
     are atomic across the fast-cycle worker thread and the event-loop thread.
+  * A quote of None or NaN is "no quote": every consumer of `prices` goes
+    through _quoted, so a pandas data gap can never make equity nan or
+    size an order against a nan equity.
   * `self.conn` is OWNED by this class. In autocommit mode a transaction
     belongs to the connection, not to a thread, so a `with budget.conn:` or
     `commit()` issued from another thread would commit whatever _txn() has
@@ -72,6 +78,18 @@ def _now(now: datetime | None = None) -> str:
 def _et_date(ts_iso: str) -> str:
     """ET calendar date of a UTC ISO string - the trading day a timestamp belongs to."""
     return datetime.fromisoformat(ts_iso).astimezone(ET).strftime('%Y-%m-%d')
+
+
+def _quoted(price) -> float | None:
+    """A usable quote as float, or None when there is none.
+
+    NaN counts as missing: it is what a data gap looks like after pandas, it
+    is not None, and it poisons every sum it touches (and min(bp, nan) keeps
+    bp, which would size the entire buying power into one slot).
+    """
+    if price is None or price != price:
+        return None
+    return float(price)
 
 
 class BudgetTracker:
@@ -125,12 +143,20 @@ class BudgetTracker:
         return float(row['v'])
 
     def _positions_value(self, prices: dict) -> float:
-        """Market value of open positions; a symbol without a quote is carried at avg_price."""
+        """Market value of open positions; a symbol without a quote (None/NaN) is carried at avg_price."""
         total = 0.0
         for pos in self.get_positions():
-            price = prices.get(pos['symbol'])
-            total += pos['shares'] * (pos['avg_price'] if price is None else float(price))
+            price = _quoted(prices.get(pos['symbol']))
+            total += pos['shares'] * (pos['avg_price'] if price is None else price)
         return total
+
+    def _pending_buy_holds(self, exclude_id: int | None = None) -> float:
+        """Sum of `amount` over PENDING BUYs - buying power they reserve before they fill."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS v FROM trades "
+            "WHERE side = 'BUY' AND status = 'PENDING' AND id IS NOT ?", (exclude_id,)
+        ).fetchone()
+        return float(row['v'])
 
     # --- account ---------------------------------------------------------
 
@@ -157,11 +183,7 @@ class BudgetTracker:
 
     def get_buying_power(self, now: datetime | None = None) -> float:
         """Cash minus unsettled proceeds minus PENDING BUY holds; never negative."""
-        pending = self.conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) AS v FROM trades "
-            "WHERE side = 'BUY' AND status = 'PENDING'"
-        ).fetchone()
-        return max(0.0, self.get_cash() - self.get_unsettled(now) - float(pending['v']))
+        return max(0.0, self.get_cash() - self.get_unsettled(now) - self._pending_buy_holds())
 
     def get_equity(self, prices: dict) -> float:
         """Cash + market value of open positions (missing quotes valued at avg_price)."""
@@ -210,21 +232,31 @@ class BudgetTracker:
         This is the only place costs are applied: the row stores the caller's
         quote (ref_price), the fill (price), fees and the net cash movement
         (amount). Callers never compute costs themselves.
+
+        Raises ValueError for a non-positive qty or ref_price: a negative
+        BUY would carry a negative amount and CREDIT cash on execute, a zero
+        qty would write a 0-share position row, and a zero price divides
+        sizing by zero. Like costs.fill on a bad side, fail loudly.
         """
         qty = round(float(qty), 6)
-        f = costs.fill(symbol, side, float(ref_price), qty)
+        ref_price = float(ref_price)
+        if not qty > 0:
+            raise ValueError(f"log_trade: qty must be positive, got {qty!r}")
+        if not ref_price > 0:
+            raise ValueError(f"log_trade: ref_price must be positive, got {ref_price!r}")
+        f = costs.fill(symbol, side, ref_price, qty)
         created_at = _now(now)
         with self._txn():
             cur = self.conn.execute(
                 "INSERT INTO trades (symbol, side, ref_price, price, shares, fees, amount, status, "
                 "created_at, week_key, trade_date, entry_probability, exit_reason) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)",
-                (symbol, side, float(ref_price), f['fill_price'], qty, f['fees'], f['net'],
+                (symbol, side, ref_price, f['fill_price'], qty, f['fees'], f['net'],
                  created_at, _week_key(now), _et_date(created_at), probability, exit_reason),
             )
             trade_id = cur.lastrowid
         logger.info(f"Logged PENDING trade #{trade_id}: {side} {costs.qty_str(qty)} {symbol} "
-                    f"@ ${f['fill_price']:,.4f} (ref ${float(ref_price):,.4f}, fees ${f['fees']:.4f})")
+                    f"@ ${f['fill_price']:,.4f} (ref ${ref_price:,.4f}, fees ${f['fees']:.4f})")
         return trade_id
 
     def execute_trade(self, trade_id: int, now: datetime | None = None) -> sqlite3.Row | None:
@@ -232,8 +264,16 @@ class BudgetTracker:
 
         Returns the executed row so callers report the ledger's fill, amount,
         fees and P&L instead of recomputing them; None when the trade is not
-        PENDING (already decided, or unknown id) or when a SELL finds nothing
-        to sell (it is marked REJECTED).
+        PENDING (already decided, or unknown id), when a BUY no longer fits
+        buying power, or when a SELL finds nothing to sell (both are marked
+        REJECTED).
+
+        A BUY can only ever spend what the ledger has. size_order reads
+        buying power outside the lock, so the fast cycle and a Discord /buy
+        can both be told the same figure before either logs its trade; the
+        re-check here, inside the transaction, is what makes the check and
+        the debit atomic. Only the slack of 6-dp qty rounding on the very
+        order size_order produced is forgiven.
 
         A SELL can only ever close what the ledger holds. Between log_trade
         and execute_trade the position may have shrunk or vanished - a manual
@@ -253,6 +293,12 @@ class BudgetTracker:
                 return None
             available_at = None
             if row['side'] == 'BUY':
+                if not self._buy_fits(row, now):
+                    self.conn.execute(
+                        "UPDATE trades SET status = 'REJECTED', settled_at = ? WHERE id = ?",
+                        (ts, trade_id),
+                    )
+                    return None
                 self.conn.execute("UPDATE account SET cash = cash - ? WHERE id = 1", (row['amount'],))
             else:
                 row = self._cap_sell_to_held(row)
@@ -280,6 +326,30 @@ class BudgetTracker:
             return row['created_at']
         opens = next_trading_day_open(datetime.fromisoformat(row['created_at']))
         return opens.astimezone(timezone.utc).isoformat(timespec='seconds')
+
+    def _buy_fits(self, row: sqlite3.Row, now: datetime | None) -> bool:
+        """Does this PENDING BUY still fit buying power? Caller holds the transaction.
+
+        Available = cash - unsettled - the OTHER pending BUY holds (this row's
+        own hold is a reservation for exactly this fill, so it is not counted
+        against itself). It is deliberately not floored at 0 like
+        get_buying_power: an over-committed account must reject, not be read
+        as "0 available + my hold".
+
+        Tolerance: size_order rounds qty to 6 dp and BUY fees are zero, so an
+        order sized at exactly buying power can overshoot it by at most half
+        a 6-dp step at the fill price (a few cents on a $100k coin). That is
+        sizing's documented slack, not the caller's; anything beyond it is.
+        """
+        available = (self.get_cash() - self.get_unsettled(now)
+                     - self._pending_buy_holds(exclude_id=row['id']))
+        tolerance = 0.5e-6 * float(row['price']) + 1e-6
+        if row['amount'] <= available + tolerance:
+            return True
+        logger.warning(f"execute_trade: BUY #{row['id']} of {costs.qty_str(float(row['shares']))} "
+                       f"{row['symbol']} needs ${row['amount']:,.2f} but only ${max(0.0, available):,.2f} "
+                       f"is available - rejecting")
+        return False
 
     def _cap_sell_to_held(self, row: sqlite3.Row) -> sqlite3.Row | None:
         """Shrink a PENDING SELL to the shares actually held. Caller holds the transaction.
@@ -400,17 +470,17 @@ class BudgetTracker:
     def get_pnl(self, price_fn) -> dict:
         """Mark open positions to market and roll up the whole account.
 
-        `price_fn(symbol)` returns a current price, or None when unavailable.
-        Those positions are listed as stale with pnl None (a data outage never
-        masquerades as break-even); for equity they are carried at avg_price
-        because the account needs one number.
+        `price_fn(symbol)` returns a current price, or None (or NaN) when
+        unavailable. Those positions are listed as stale with pnl None (a
+        data outage never masquerades as break-even); for equity they are
+        carried at avg_price because the account needs one number.
         """
         positions, unrealized, cost_total, market_total, stale, prices = [], 0.0, 0.0, 0.0, [], {}
 
         for pos in self.get_positions():
             price = None
             try:
-                price = price_fn(pos['symbol'])
+                price = _quoted(price_fn(pos['symbol']))
             except Exception as e:
                 logger.warning(f"price lookup failed for {pos['symbol']}: {e}")
 

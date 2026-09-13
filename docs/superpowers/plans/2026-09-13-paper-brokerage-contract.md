@@ -133,12 +133,18 @@ def size_order(self, symbol, ref_price, prices=None, now=None) -> tuple[float, f
 # trade lifecycle (all under self._lock, BEGIN IMMEDIATE)
 def log_trade(self, symbol, side, ref_price, qty, *, probability=None, exit_reason=None, now=None) -> int
     # rounds qty to 6dp, calls costs.fill, inserts PENDING row with ref_price, price=fill, fees,
-    # amount=net, shares=qty, trade_date=_et_date(created_at), entry_probability, exit_reason, week_key
+    # amount=net, shares=qty, trade_date=_et_date(created_at), entry_probability, exit_reason, week_key.
+    # Raises ValueError when qty (after rounding) or ref_price is not > 0; nothing is written.
 def execute_trade(self, trade_id, now=None) -> sqlite3.Row | None
     # PENDING -> EXECUTED; BUY: cash -= amount; SELL: cash += amount, available_at
     # (stock: next_trading_day_open(created_at) as UTC ISO; crypto: created_at),
     # realized_pnl = amount - closed*avg_price, gross_pnl = realized_pnl + fees;
     # applies position (entry_ref weighting, |shares|<1e-6 -> 0). Returns the executed row.
+    # Returns None (nothing moved) when the row is not PENDING, and marks the row REJECTED and
+    # returns None when, inside the transaction: a BUY's amount exceeds cash - unsettled - the
+    # OTHER pending BUY holds (6-dp qty-rounding slack forgiven), or a SELL finds nothing held.
+    # A SELL for more than is held is capped to the held qty (shares/fees/amount recomputed).
+    # Callers MUST treat None as "did not fill" for both sides.
 def reject_trade(self, trade_id, now=None) -> bool
 
 # positions / reporting
@@ -147,6 +153,8 @@ def get_pnl(self, price_fn) -> dict
     # keys: positions, stale, realized, unrealized, total, cost_basis, market_value,
     #       cash, unsettled, buying_power, equity, starting_cash, all_time_net, all_time_pct,
     #       fees_paid, gross_pnl   (return_pct REMOVED)
+    # price_fn(symbol) -> price | None; None AND NaN mean "no quote" (stale, carried at avg_price).
+    # The same None/NaN rule applies to every `prices` dict (get_equity, size_order, record_equity).
 def get_trades_since_open(self, day: str | None = None) -> list[sqlite3.Row]  # EXECUTED, created_at >= opened_at, optional trade_date filter
 
 # day state / equity history
