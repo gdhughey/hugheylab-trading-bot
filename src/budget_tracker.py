@@ -413,3 +413,61 @@ class BudgetTracker:
             sql += " AND trade_date = ?"
             params.append(day)
         return self.conn.execute(sql + " ORDER BY created_at, id", params).fetchall()
+
+    # --- day state / equity history --------------------------------------
+
+    def get_day_state(self, date_et: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM day_state WHERE date = ?", (date_et,)).fetchone()
+
+    def ensure_day_state(self, date_et: str, equity: float) -> sqlite3.Row:
+        """Create the day's row with its start-of-day equity; a same-date restart keeps the original."""
+        with self._txn():
+            self.conn.execute(
+                "INSERT OR IGNORE INTO day_state (date, start_equity) VALUES (?, ?)",
+                (date_et, float(equity)),
+            )
+        return self.get_day_state(date_et)
+
+    def set_day_flag(self, date_et: str, column: str, ts: str | None = None) -> None:
+        """Stamp one of the day's latches (loss tripped / announced, report posted)."""
+        if column not in DAY_FLAGS:
+            raise ValueError(f"set_day_flag: {column!r} is not one of {DAY_FLAGS}")
+        with self._txn():
+            cur = self.conn.execute(
+                f"UPDATE day_state SET {column} = ? WHERE date = ?", (ts or _now(), date_et)
+            )
+            n = cur.rowcount
+        if not n:
+            logger.warning(f"set_day_flag: no day_state row for {date_et} ({column} not set)")
+
+    def record_equity(self, date_et: str, prices: dict, now: datetime | None = None) -> dict:
+        """Upsert the day's equity snapshot (written by the 16:05 ET report tick, not by /pnl)."""
+        with self._txn():
+            # Read inside the transaction so the snapshot cannot straddle a
+            # trade executing on the other thread.
+            cash = self.get_cash()
+            positions_value = self._positions_value(prices)
+            self.conn.execute(
+                "INSERT INTO equity_history (date, cash, positions_value, equity, fees_to_date, "
+                "realized_to_date, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(date) DO UPDATE SET cash=excluded.cash, "
+                "positions_value=excluded.positions_value, equity=excluded.equity, "
+                "fees_to_date=excluded.fees_to_date, realized_to_date=excluded.realized_to_date, "
+                "recorded_at=excluded.recorded_at",
+                (date_et, cash, positions_value, cash + positions_value,
+                 self.get_fees_paid(), self.get_realized_pnl(), _now(now)),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM equity_history WHERE date = ?", (date_et,)).fetchone()
+        return dict(row)
+
+    def equity_series(self) -> list[dict]:
+        """Daily equity, oldest first, with day 0 = starting cash on the open date.
+
+        Day 0 is synthetic (only `date` and `equity`); the rest are full
+        equity_history rows. Drawdown and the chart need the starting point
+        so a losing first day is not a 0% drawdown.
+        """
+        rows = self.conn.execute("SELECT * FROM equity_history ORDER BY date").fetchall()
+        return ([{'date': self.opened_at()[:10], 'equity': self.starting_cash()}]
+                + [dict(r) for r in rows])

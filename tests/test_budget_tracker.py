@@ -340,3 +340,54 @@ def test_get_pnl_keys_and_equity(bt):
     assert pnl['total'] == pytest.approx(pnl['unrealized'])
     assert [p['symbol'] for p in pnl['positions']] == ['AAPL', 'MSFT']
     assert pnl['positions'][1]['price'] is None and pnl['positions'][1]['pnl'] is None
+
+
+# --- day state / equity history -----------------------------------------------
+
+def test_day_state_baseline_and_flags(bt):
+    assert bt.get_day_state('2026-09-18') is None
+    row = bt.ensure_day_state('2026-09-18', 500.0)
+    assert row['date'] == '2026-09-18'
+    assert row['start_equity'] == 500.0
+    assert row['loss_tripped_at'] is None
+    assert row['loss_announced_at'] is None
+    assert row['report_posted_at'] is None
+    # a same-date restart must keep the original baseline
+    assert bt.ensure_day_state('2026-09-18', 480.0)['start_equity'] == 500.0
+    tripped = FRI_1555.isoformat(timespec='seconds')
+    posted = et(2026, 9, 18, 16, 5).isoformat(timespec='seconds')
+    bt.set_day_flag('2026-09-18', 'loss_tripped_at', tripped)
+    bt.set_day_flag('2026-09-18', 'report_posted_at', posted)
+    row = bt.get_day_state('2026-09-18')
+    assert row['loss_tripped_at'] == tripped
+    assert row['loss_announced_at'] is None
+    assert row['report_posted_at'] == posted
+    with pytest.raises(ValueError):
+        bt.set_day_flag('2026-09-18', 'start_equity', tripped)
+
+
+def test_equity_series_starts_with_starting_cash_and_record_equity_upserts(bt):
+    assert bt.equity_series() == [{'date': '2026-09-14', 'equity': 500.0}]
+    _round_trip(bt, 'AAPL', 'BUY', 100.0, 1.0, FRI_1000)
+    first = bt.record_equity('2026-09-18', {'AAPL': 90.0}, now=FRI_1600)
+    assert first['date'] == '2026-09-18'
+    assert first['cash'] == pytest.approx(500.0 - 100.05)
+    assert first['positions_value'] == pytest.approx(90.0)
+    assert first['equity'] == pytest.approx(first['cash'] + 90.0)
+    assert first['fees_to_date'] == 0.0 and first['realized_to_date'] == 0.0
+    assert first['recorded_at'] == FRI_1600.isoformat(timespec='seconds')
+    # second call for the same date replaces, not duplicates
+    later = et(2026, 9, 18, 16, 10)
+    second = bt.record_equity('2026-09-18', {'AAPL': 95.0}, now=later)
+    assert second['positions_value'] == pytest.approx(95.0)
+    assert second['equity'] == pytest.approx(first['cash'] + 95.0)
+    assert second['recorded_at'] == later.isoformat(timespec='seconds')
+    assert bt.conn.execute("SELECT COUNT(*) AS n FROM equity_history").fetchone()['n'] == 1
+    # a missing quote is carried at avg_price
+    carried = bt.record_equity('2026-09-21', {}, now=MON_0930)
+    assert carried['positions_value'] == pytest.approx(100.05)
+    series = bt.equity_series()
+    assert [s['date'] for s in series] == ['2026-09-14', '2026-09-18', '2026-09-21']
+    assert series[0] == {'date': '2026-09-14', 'equity': 500.0}
+    assert series[1]['equity'] == pytest.approx(second['equity'])
+    assert series[2]['equity'] == pytest.approx(carried['equity'])
