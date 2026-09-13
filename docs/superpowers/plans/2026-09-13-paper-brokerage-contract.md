@@ -162,7 +162,7 @@ def get_day_state(self, date_et: str) -> sqlite3.Row | None
 def ensure_day_state(self, date_et: str, equity: float) -> sqlite3.Row   # INSERT OR IGNORE then return
 def set_day_flag(self, date_et: str, column: str, ts: str | None = None) -> None  # column in ('loss_tripped_at','loss_announced_at','report_posted_at')
 def record_equity(self, date_et: str, prices: dict, now=None) -> dict    # upserts equity_history; returns the row as dict
-def equity_series(self) -> list[dict]          # equity_history rows ordered by date, prefixed by {'date': opened_at[:10], 'equity': starting_cash}
+def equity_series(self) -> list[dict]          # equity_history rows ordered by date, prefixed by {'date': _et_date(opened_at), 'equity': starting_cash} (ET date, NOT opened_at[:10]: an evening open is already the next day in UTC)
 ```
 Deleted: `weekly_budget`, `set_weekly_budget`, `get_weekly_spent`, `get_turnover`,
 `get_remaining_budget`, `can_trade`, `get_statistics`, `_sum`, `_deployed`, `_committed`.

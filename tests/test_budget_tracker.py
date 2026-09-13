@@ -595,3 +595,17 @@ def test_equity_series_starts_with_starting_cash_and_record_equity_upserts(bt):
     assert series[0] == {'date': '2026-09-14', 'equity': 500.0}
     assert series[1]['equity'] == pytest.approx(second['equity'])
     assert series[2]['equity'] == pytest.approx(carried['equity'])
+
+
+def test_equity_series_day0_is_the_et_date_of_an_evening_open(tmp_path, monkeypatch):
+    # An account opened Mon 20:30 ET is already Tue in UTC. Day 0 must be the
+    # ET date, like trade_date, day_state and equity_history, or the first
+    # record_equity for Tuesday lands on the same date as day 0.
+    _pin_env(monkeypatch)
+    path = str(tmp_path / 'evening.db')
+    Database(path, now=et(2026, 9, 14, 20, 30))
+    bt = BudgetTracker(path)
+    assert bt.opened_at() == '2026-09-15T00:30:00+00:00'
+    assert bt.equity_series() == [{'date': '2026-09-14', 'equity': 500.0}]
+    bt.record_equity('2026-09-15', {}, now=et(2026, 9, 15, 16, 5))
+    assert [s['date'] for s in bt.equity_series()] == ['2026-09-14', '2026-09-15']

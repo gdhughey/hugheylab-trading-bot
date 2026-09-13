@@ -587,8 +587,10 @@ class BudgetTracker:
 
         Day 0 is synthetic (only `date` and `equity`); the rest are full
         equity_history rows. Drawdown and the chart need the starting point
-        so a losing first day is not a 0% drawdown.
+        so a losing first day is not a 0% drawdown. Its date is the ET
+        calendar day of opened_at, like every other date in the series - an
+        evening open (after 20:00 ET) is already the next day in UTC.
         """
         rows = self.conn.execute("SELECT * FROM equity_history ORDER BY date").fetchall()
-        return ([{'date': self.opened_at()[:10], 'equity': self.starting_cash()}]
+        return ([{'date': _et_date(self.opened_at()), 'equity': self.starting_cash()}]
                 + [dict(r) for r in rows])
