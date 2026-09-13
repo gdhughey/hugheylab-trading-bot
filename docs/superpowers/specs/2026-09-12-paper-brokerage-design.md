@@ -91,7 +91,7 @@ and count filters `created_at >= account.opened_at`. The one exception is
 keep its max-hold clock). The positions table is flat at open (it already is).
 
 Every mutating `BudgetTracker` method (`log_trade`, `execute_trade`,
-`reject_trade`, `record_day_state`, `record_equity`) takes one
+`reject_trade`, `ensure_day_state`, `set_day_flag`, `record_equity`) takes one
 `threading.Lock` and runs its SQL in one transaction opened with
 `BEGIN IMMEDIATE`, so a buying-power check and the cash debit are atomic
 across the fast-cycle worker thread and the event-loop thread.
@@ -207,7 +207,7 @@ order:
 2. EV gate: `ev < MIN_EV_TO_TRADE` and `FAST_IGNORE_EV` unset →
    `(False, existing "Not trading" text)`.
 3. `ev < MIN_EV_TO_TRADE` and `FAST_IGNORE_EV` set → `(True, "trading on paper
-   despite EV {ev:+.3f}% below the {floor:.2%} floor (FAST_IGNORE_EV on)")`.
+   despite EV {ev*100:+.3f}% below the {floor:.2%} floor (FAST_IGNORE_EV on)")`.
 4. Otherwise `(True, "Trading. Edge clears the {floor:.2%} cost floor")`.
 
 Used at: `FastTrader.cycle` (`tradeable()` and the skip reason), the on_ready
@@ -268,7 +268,7 @@ unconditionally (not only when intraday training succeeds). Each tick, with
 
 `build_scorecard(budget, engine, intraday, day) -> dict` lives in new
 `src/scorecard.py` with `wilson_ci(hits, n)` and `mean_ci(values)` (mean,
-SE, 95% t-interval). `discord_bot._scorecard_embed(day)` renders it and is
+SE, 95% normal interval with z=1.96 — scipy is not a dependency). `discord_bot._scorecard_embed(day)` renders it and is
 used by the 16:05 report, `/pnl` and `/summary`. `/stats` is removed
 (`get_statistics` deleted). The "Registered N slash commands" log count is
 updated. "Today" everywhere means the ET date (`trades.trade_date`).
