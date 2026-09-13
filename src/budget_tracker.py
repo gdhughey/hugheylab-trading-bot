@@ -16,8 +16,12 @@ Account semantics:
     the SELL row (`trades.available_at`), never recomputed.
   * Every sum, count and report filters `created_at >= account.opened_at`, so
     trades from before the account opened stay in the DB but never count.
-  * Costs are applied in exactly one place: log_trade calls costs.fill and
-    stores ref_price (the caller's quote), price (the fill), fees and amount.
+  * Costs are applied only here: log_trade calls costs.fill and stores
+    ref_price (the caller's quote), price (the fill), fees and amount;
+    execute_trade re-runs it only when it must cap a SELL at the held qty.
+  * A SELL can never credit more than the position it closes: an oversized
+    SELL is capped to the held shares and one against a flat position is
+    REJECTED, so cash + positions never lie about each other.
   * Every mutating method takes one threading.Lock and runs inside a single
     BEGIN IMMEDIATE transaction, so a buying-power check and the cash debit
     are atomic across the fast-cycle worker thread and the event-loop thread.
@@ -228,7 +232,16 @@ class BudgetTracker:
 
         Returns the executed row so callers report the ledger's fill, amount,
         fees and P&L instead of recomputing them; None when the trade is not
-        PENDING (already decided, or unknown id).
+        PENDING (already decided, or unknown id) or when a SELL finds nothing
+        to sell (it is marked REJECTED).
+
+        A SELL can only ever close what the ledger holds. Between log_trade
+        and execute_trade the position may have shrunk or vanished - a manual
+        /sell awaiting approval while the fast cycle auto-exits the same
+        symbol, or two exit rows left PENDING across a restart. Crediting the
+        full proceeds then would mint cash out of nothing, so the fill is
+        capped at the held quantity (costs recomputed, row updated) before
+        cash moves, and a SELL against a flat position is REJECTED.
         """
         ts = _now(now)
         with self._txn():
@@ -242,6 +255,13 @@ class BudgetTracker:
             if row['side'] == 'BUY':
                 self.conn.execute("UPDATE account SET cash = cash - ? WHERE id = 1", (row['amount'],))
             else:
+                row = self._cap_sell_to_held(row)
+                if row is None:
+                    self.conn.execute(
+                        "UPDATE trades SET status = 'REJECTED', settled_at = ? WHERE id = ?",
+                        (ts, trade_id),
+                    )
+                    return None
                 self.conn.execute("UPDATE account SET cash = cash + ? WHERE id = 1", (row['amount'],))
                 available_at = self._available_at(row)
             self._apply_position(row, ts)
@@ -260,6 +280,34 @@ class BudgetTracker:
             return row['created_at']
         opens = next_trading_day_open(datetime.fromisoformat(row['created_at']))
         return opens.astimezone(timezone.utc).isoformat(timespec='seconds')
+
+    def _cap_sell_to_held(self, row: sqlite3.Row) -> sqlite3.Row | None:
+        """Shrink a PENDING SELL to the shares actually held. Caller holds the transaction.
+
+        Returns the (possibly rewritten) row, or None when nothing is held -
+        the caller rejects the trade. A capped row gets its shares, fees and
+        amount recomputed through costs.fill at the original ref_price, so
+        the ledger still applies costs in one place and cash is credited only
+        for shares that existed.
+        """
+        pos = self.conn.execute(
+            "SELECT shares FROM positions WHERE symbol = ?", (row['symbol'],)).fetchone()
+        held = float(pos['shares']) if pos else 0.0
+        qty = float(row['shares'])
+        if held < 1e-6:
+            logger.warning(f"execute_trade: SELL #{row['id']} of {costs.qty_str(qty)} {row['symbol']} "
+                           f"but nothing is held - rejecting")
+            return None
+        if qty <= held + 1e-6:
+            return row
+        logger.warning(f"execute_trade: SELL #{row['id']} of {costs.qty_str(qty)} {row['symbol']} "
+                       f"exceeds the {costs.qty_str(held)} held - capping the fill")
+        f = costs.fill(row['symbol'], 'SELL', float(row['ref_price']), held)
+        self.conn.execute(
+            "UPDATE trades SET shares = ?, fees = ?, amount = ? WHERE id = ?",
+            (held, f['fees'], f['net'], row['id']),
+        )
+        return self.conn.execute("SELECT * FROM trades WHERE id = ?", (row['id'],)).fetchone()
 
     def reject_trade(self, trade_id: int, now: datetime | None = None) -> bool:
         """PENDING -> REJECTED (declined or timed out); releases its buying-power hold."""
@@ -305,6 +353,9 @@ class BudgetTracker:
             new_shares = held - qty
             new_avg, new_ref = avg, entry_ref                    # a partial SELL leaves both alone
             if new_shares < -1e-6:
+                # execute_trade caps a SELL at the held quantity before cash
+                # moves, so this only fires if a caller bypasses it; the
+                # position can still never go negative.
                 logger.warning(f"SELL exceeds held shares for {row['symbol']} - clamping to 0")
                 new_shares = 0.0
 

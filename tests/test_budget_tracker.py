@@ -231,6 +231,59 @@ def test_dust_is_written_as_zero_and_hidden(bt):
     assert bt.get_positions() == []
 
 
+def test_sell_of_an_unheld_symbol_is_rejected_and_moves_nothing(bt):
+    tid = bt.log_trade('MSFT', 'SELL', 100.0, 1.0, exit_reason='manual', now=FRI_1555)
+    assert bt.execute_trade(tid, now=FRI_1555) is None
+    row = bt.conn.execute("SELECT * FROM trades WHERE id = ?", (tid,)).fetchone()
+    assert row['status'] == 'REJECTED'
+    assert row['realized_pnl'] is None and row['gross_pnl'] is None
+    assert bt.get_cash() == 500.0
+    assert bt.get_buying_power(now=FRI_1555) == 500.0
+    assert bt.get_realized_pnl() == 0.0 and bt.get_fees_paid() == 0.0
+    assert bt.get_positions() == []
+    assert bt.get_trades_since_open() == []
+    assert bt.conn.execute("SELECT COUNT(*) AS n FROM positions").fetchone()['n'] == 0
+
+
+def test_manual_sell_approved_after_auto_exit_is_rejected(bt):
+    # The spec's /sell logs a PENDING SELL for the whole position; while it
+    # waits for approval the fast cycle exits the same symbol. The approved
+    # manual SELL must not mint phantom cash against a flat position.
+    buy = _round_trip(bt, 'AAPL', 'BUY', 100.0, 1.0, FRI_1000)
+    manual = bt.log_trade('AAPL', 'SELL', 100.0, 1.0, exit_reason='manual', now=FRI_1000)
+    auto = _round_trip(bt, 'AAPL', 'SELL', 100.0, 1.0, FRI_1555, exit_reason='eod')
+    cash_after_auto = bt.get_cash()
+    assert cash_after_auto == pytest.approx(500.0 - buy['amount'] + auto['amount'])
+    assert bt.execute_trade(manual, now=FRI_1555) is None
+    assert bt.conn.execute("SELECT status FROM trades WHERE id = ?", (manual,)).fetchone()['status'] == 'REJECTED'
+    assert bt.get_cash() == pytest.approx(cash_after_auto)
+    assert bt.get_realized_pnl() == pytest.approx(auto['realized_pnl'])
+    assert bt.get_positions() == []
+    assert [r['id'] for r in bt.get_trades_since_open()] == [buy['id'], auto['id']]
+
+
+def test_sell_of_more_than_held_is_capped_to_the_position(bt):
+    buy = _round_trip(bt, 'AAPL', 'BUY', 100.0, 1.0, FRI_1000)
+    tid = bt.log_trade('AAPL', 'SELL', 100.0, 3.0, exit_reason='manual', now=FRI_1555)
+    pending = bt.conn.execute("SELECT * FROM trades WHERE id = ?", (tid,)).fetchone()
+    assert pending['shares'] == 3.0
+    sell = bt.execute_trade(tid, now=FRI_1555)
+    assert sell['status'] == 'EXECUTED'
+    assert sell['shares'] == 1.0                                # capped to what was held
+    assert sell['price'] == pytest.approx(100.0 * (1 - 0.0005))
+    gross = 1.0 * sell['price']
+    assert sell['fees'] == pytest.approx(0.0000206 * gross + 0.000195 * 1.0)
+    assert sell['amount'] == pytest.approx(gross - sell['fees'])
+    assert sell['amount'] < pending['amount'] / 2               # not the 3-share proceeds
+    assert sell['realized_pnl'] == pytest.approx(sell['amount'] - buy['amount'])
+    assert sell['realized_pnl'] < 0                             # slippage + fees, no phantom gain
+    assert sell['gross_pnl'] == pytest.approx(sell['realized_pnl'] + sell['fees'])
+    assert bt.get_cash() == pytest.approx(500.0 - buy['amount'] + sell['amount'])
+    assert bt.get_realized_pnl() == pytest.approx(sell['realized_pnl'])
+    assert bt.get_unsettled(now=FRI_1555) == pytest.approx(sell['amount'])
+    assert bt.get_positions() == []
+
+
 # --- sizing ----------------------------------------------------------------
 
 def test_size_order_is_fractional_and_dollar_based(bt):

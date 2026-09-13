@@ -13,9 +13,11 @@ the SEC transaction fee and FINRA TAF on stock SELLs, and a per-side
 markup on crypto with no other fee. Every assumption is an env setting so
 a user on a different venue changes numbers, not code.
 
-`fill` is pure and is called from exactly one place,
-`BudgetTracker.log_trade`; no caller applies costs itself. Env is read at
-call time (not import time) so tests can vary it with monkeypatch.
+`fill` is pure and is called only from `BudgetTracker` (`log_trade`, and
+`execute_trade` when it caps an oversized SELL at the held quantity;
+`size_order` uses it for the estimated fill); no other caller applies costs
+itself. Env is read at call time (not import time) so tests can vary it
+with monkeypatch.
 """
 
 import os
