@@ -10,7 +10,9 @@ Order of operations each cycle matters: refresh prices, then EXIT before ENTER.
 Exiting first frees capital and position slots in the same cycle, and means a
 stop-loss is never delayed by an unrelated entry.
 
-Still paper. Every "trade" is a row in SQLite; no broker is connected.
+Still paper. Every "trade" is a row in SQLite; no broker is connected. The
+ledger (BudgetTracker) models a cash account: fills carry slippage/spread,
+stock sells settle T+1, and every entry is a fraction of equity.
 """
 
 import os
@@ -101,10 +103,13 @@ class FastTrader:
     def _recover_entry_times(self):
         """Rebuild entry times from the ledger after a restart.
 
-        These lived only in memory, so any position opened before a restart had
-        no entry time and FAST_MAX_HOLD_MIN could never fire for it - the
+        These live only in memory, so any position opened before a restart had
+        no entry time and the max-hold exit could never fire for it - the
         position would sit indefinitely (crypto has no end-of-day backstop).
         The service restarted four times in two days, so this was live.
+
+        Deliberately NOT filtered by account.opened_at: a held position keeps
+        its clock whichever account it was opened under.
         """
         try:
             rows = self.budget.conn.execute(
@@ -146,162 +151,233 @@ class FastTrader:
                 pass
         return fallback
 
+    def _account_fields(self, prices, now):
+        """Equity / buying power / unsettled for the cycle summary.
+
+        Always derived from the ledger, never cached, so a restart cannot
+        disagree with the DB.
+        """
+        return {'equity': self.budget.get_equity(prices),
+                'buying_power': self.budget.get_buying_power(now=now),
+                'unsettled': self.budget.get_unsettled(now=now)}
+
     # --- the cycle -------------------------------------------------------
 
-    def cycle(self):
+    def cycle(self, now=None):
         """One pass. Returns a dict describing what happened (for reporting).
 
         Synchronous by design - the caller runs it in a worker thread, because
-        everything in here (yfinance, sklearn, sqlite) blocks.
+        everything in here (yfinance, sklearn, sqlite) blocks. `now` (UTC,
+        tz-aware) is injectable so tests never depend on the wall clock.
+
+        Order: market state -> gates -> fetch -> one quote per held symbol ->
+        day_state baseline -> exits -> loss-limit check -> scan_all + signal
+        log -> entries. Exits run before the loss check so a stop that trips
+        the limit is booked in the same cycle; the check runs before entries
+        so a tripped limit blocks them immediately.
         """
-        state, desc = market_state()
+        now = now or datetime.now(timezone.utc)
+        now_et = now.astimezone(ET)
+        today_et = now_et.strftime('%Y-%m-%d')
+        state, desc = market_state(now)
         stocks_open = state == 'open'
         crypto_syms = [s for s in self.engine.symbols if is_crypto(s)]
+        metrics = self.engine.metrics or {}
+        # One verdict per class in the universe. A gated class still gets its
+        # exits run; the gate only blocks entries.
+        gates = {cls: class_gate(cls, metrics.get(cls))
+                 for cls in sorted({asset_class(s) for s in self.engine.symbols})}
         summary = {'state': state, 'desc': desc, 'exits': [], 'entries': [],
-                   'skipped': [], 'candidates': [], 'ts': datetime.now(ET),
-                   'stocks_open': stocks_open, 'crypto': len(crypto_syms)}
+                   'skipped': [], 'candidates': [], 'ts': now_et,
+                   'stocks_open': stocks_open, 'crypto': len(crypto_syms),
+                   'gates': gates,
+                   'blocked_classes': [c for c, (ok, _) in gates.items() if not ok],
+                   'loss_tripped': False, 'loss_announce': False}
 
         # Crypto never closes, so an outside-hours cycle is still a working
         # cycle whenever the universe holds any coins.
         if not stocks_open and not crypto_syms:
             summary['note'] = f"Market {desc}, no crypto in universe - not trading."
+            summary.update(self._account_fields({}, now))
             self.last_summary = summary
             return summary
 
-        # Refuse to trade an asset class whose backtested expected value is
-        # negative. Now that stocks and crypto have separate models this is
-        # per-class, so a losing crypto model no longer drags stocks down with
-        # it (or vice versa). Set FAST_IGNORE_EV=1 to override deliberately.
-        respect_ev = os.getenv('FAST_IGNORE_EV', '0') not in ('1', 'true', 'yes')
-        # An EV barely above zero is not tradeable: a round trip costs roughly
-        # 5-40 bps on stocks and 22-100+ bps on retail crypto venues, none of
-        # which the backtest models. Require a real margin over costs, not just
-        # a positive sign.
-        min_ev = float(os.getenv('MIN_EV_TO_TRADE', 0.003))
-        blocked = set()
-        if respect_ev:
-            for cls, m in (self.engine.metrics or {}).items():
-                if m.get('ev', 0) < min_ev:
-                    blocked.add(cls)
-        summary['blocked_classes'] = sorted(blocked)
-
-        def tradeable(sym):
-            if respect_ev and asset_class(sym) in blocked:
-                return False
-            return stocks_open or is_crypto(sym)
-
         rows = self.engine.fetch()
         summary['rows'] = rows
-
-        held = {p['symbol']: p for p in self.budget.get_positions()}
-        to_close = minutes_to_close()
+        to_close = minutes_to_close(now)
         summary['minutes_to_close'] = to_close
+
+        # One quote per held symbol. The same dict prices exits, the day_state
+        # baseline, the loss-limit check and entry sizing - no second quote.
+        held = {p['symbol']: p for p in self.budget.get_positions()}
+        prices = {}
+        for sym, pos in held.items():
+            sig = self.engine.signal(sym)
+            prices[sym] = self._price(sym, sig['price'] if sig else pos['avg_price'])
+
+        # INSERT OR IGNORE: a same-date restart keeps the original baseline,
+        # so the loss limit cannot be reset by bouncing the service.
+        day = self.budget.ensure_day_state(today_et, self.budget.get_equity(prices))
 
         # ---- EXITS first: frees cash and slots within this same cycle ----
         for sym, pos in held.items():
-            # Exits ignore the EV block: an already-open position must always be
-            # closeable, otherwise a newly-negative model would strand it.
+            # Exits ignore the class gate and the loss limit: an open position
+            # must always be closeable, otherwise a newly-gated class would
+            # strand it.
             if not (stocks_open or is_crypto(sym)):
                 continue
-            sig = self.engine.signal(sym)
-            price = self._price(sym, sig['price'] if sig else pos['avg_price'])
-            change = (price - pos['avg_price']) / pos['avg_price'] if pos['avg_price'] else 0
-            reason = None
+            ref = prices[sym]
+            # Barriers are measured reference-to-reference, the same move the
+            # labels use. avg_price carries the entry spread/slippage, so
+            # measuring against it would fire the 0.4% crypto stop on an
+            # unchanged quote (avg sits 0.6% above ref at entry).
+            entry_ref = pos['entry_ref']
+            change = (ref - entry_ref) / entry_ref if entry_ref else 0.0
 
             # Exits must use the SAME barriers the model was trained on, and
             # those differ by asset class.
             cls = asset_class(sym)
             tp, sl, _ = barriers(cls)
+            reason = exit_reason = None
 
             # Crypto has no close to flatten into - holding it overnight is
             # normal, so the EOD rule applies to stocks only.
             if not is_crypto(sym) and to_close <= self.eod_flatten_min:
-                reason = f"end of day ({to_close:.0f} min to close)"
-            elif change <= -sl:
-                reason = f"stop loss {change:+.2%}"
-            elif change >= tp:
-                reason = f"take profit {change:+.2%}"
+                reason, exit_reason = f"end of day ({to_close:.0f} min to close)", 'eod'
+            elif change <= -sl + BARRIER_EPS:
+                reason, exit_reason = f"stop loss {change:+.2%}", 'sl'
+            elif change >= tp - BARRIER_EPS:
+                reason, exit_reason = f"take profit {change:+.2%}", 'tp'
             else:
                 opened = self.entry_time.get(sym)
-                if opened and (datetime.now(ET) - opened).total_seconds() / 60 > self.max_hold_min:
-                    reason = f"held {self.max_hold_min:.0f} min without hitting a target"
+                hold = max_hold_min(cls)
+                if opened and (now_et - opened).total_seconds() / 60 > hold:
+                    reason, exit_reason = (f"held {hold:.0f} min without hitting a target",
+                                           'timeout')
+            if not reason:
+                continue
 
-            if reason:
-                tid = self.budget.log_trade(sym, 'SELL', price, pos['shares'])
-                self.budget.execute_trade(tid)
-                pnl = (price - pos['avg_price']) * pos['shares']
-                summary['exits'].append({
-                    'symbol': sym, 'shares': pos['shares'], 'price': price,
-                    'reason': reason, 'pnl': pnl, 'pct': change, 'trade_id': tid})
-                self.cooldown[sym] = datetime.now(ET) + timedelta(minutes=self.cooldown_min)
-                self.entry_time.pop(sym, None)
-                logger.info(f"[fast] EXIT {pos['shares']} {sym} @ ${price:,.2f} "
-                            f"({reason}) P&L ${pnl:+,.2f}")
+            tid = self.budget.log_trade(sym, 'SELL', ref, pos['shares'],
+                                        exit_reason=exit_reason, now=now)
+            row = self.budget.execute_trade(tid, now=now)
+            if row is None:
+                logger.error(f"[fast] EXIT {sym}: trade #{tid} did not execute")
+                continue
+            summary['exits'].append({
+                'symbol': sym, 'shares': pos['shares'], 'price': row['price'],
+                'ref_price': ref, 'reason': reason, 'exit_reason': exit_reason,
+                'pnl': row['realized_pnl'], 'gross': row['gross_pnl'],
+                'fees': row['fees'], 'pct': change, 'trade_id': tid})
+            self.cooldown[sym] = now_et + timedelta(minutes=self.cooldown_min)
+            self.entry_time.pop(sym, None)
+            logger.info(f"[fast] EXIT {costs.qty_str(pos['shares'])} {sym} @ "
+                        f"${row['price']:,.2f} (ref ${ref:,.2f}, {reason}) "
+                        f"P&L ${row['realized_pnl']:+,.2f} after ${row['fees']:,.2f} fees")
 
-        # ---- ENTRIES ------------------------------------------------------
-        near_bell = stocks_open and to_close <= self.eod_flatten_min
-        if near_bell and not crypto_syms:
-            summary['note'] = "Too close to the bell to open anything new."
-            self.last_summary = summary
-            return summary
+        # ---- DAILY LOSS LIMIT: measured after exits so a stop that just fired counts ----
+        acct = self._account_fields(prices, now)
+        summary.update(acct)
+        loss_tripped = day['loss_tripped_at'] is not None
+        limit_pct = _cfg('DAILY_LOSS_LIMIT_PCT', 3)
+        floor_equity = day['start_equity'] * (1 - limit_pct / 100)
+        if not loss_tripped and acct['equity'] <= floor_equity:
+            self.budget.set_day_flag(today_et, 'loss_tripped_at',
+                                     now.isoformat(timespec='seconds'))
+            loss_tripped = True
+            summary['loss_announce'] = True     # only the cycle that trips announces
+            logger.warning(f"[fast] Daily loss limit tripped: equity ${acct['equity']:,.2f} "
+                           f"<= ${floor_equity:,.2f} ({limit_pct:g}% below the "
+                           f"${day['start_equity']:,.2f} start) - no entries until "
+                           f"the next ET date")
+        summary['loss_tripped'] = loss_tripped
+
+        # ---- SIGNAL LOG + ENTRIES -----------------------------------------
+        # Every scored symbol is logged every cycle (INSERT OR IGNORE on the
+        # bar, so the 60 s poll cannot inflate n); candidates are the above-bar
+        # rows, already ranked by margin over each class's own bar.
+        # The log writes go through budget.conn on THIS thread - the same
+        # worker thread that runs the ledger's transactions, so there is no
+        # cross-thread use of the connection (label_pending, which runs on the
+        # event-loop thread, opens its own connection).
+        signals = self.engine.scan_all()
+        try:
+            signal_log.record(self.budget.conn, signals, now=now)
+        except Exception as e:
+            # The log is measurement, not trading - never let it stop a cycle.
+            logger.warning(f"[fast] signal log write failed: {e}")
+        candidates = [s for s in signals if s.get('above_bar')]
+        summary['candidates'] = candidates[:5]
+        summary['bars'] = {c: self.engine.threshold(c)
+                           for c in (metrics or {'stock': {}})}
+        summary['bar'] = min(summary['bars'].values(), default=0.0)
 
         held = {p['symbol']: p for p in self.budget.get_positions()}
         slots = self.max_positions - len(held)
-        candidates = self.engine.scan()
-        summary['candidates'] = candidates[:5]
-        summary['bars'] = {c: self.engine.threshold(c)
-                           for c in (self.engine.metrics or {'stock': {}})}
-        summary['bar'] = min(summary['bars'].values(), default=0.0)
-
         if slots <= 0:
             summary['note'] = f"Holding {len(held)}/{self.max_positions} - no free slots."
             self.last_summary = summary
             return summary
 
-        now = datetime.now(ET)
+        near_bell = stocks_open and to_close <= self.eod_flatten_min
+        min_order = _cfg('MIN_ORDER_USD', 1)
         for sig in candidates:
             if slots <= 0:
                 break
             sym = sig['symbol']
+            cls = asset_class(sym)
             if sym in held:
                 continue
-            if respect_ev and asset_class(sym) in blocked:
-                summary['skipped'].append(
-                    (sym, f"{asset_class(sym)} EV below the {min_ev:.2%} cost floor"))
+            if loss_tripped:
+                summary['skipped'].append((sym, 'daily loss limit'))
                 continue
-            if not tradeable(sym):
+            ok, text = gates[cls]
+            if not ok:
+                summary['skipped'].append((sym, f'class gated: {text}'))
+                continue
+            if not (stocks_open or is_crypto(sym)):
                 summary['skipped'].append((sym, 'market closed'))
                 continue
             if near_bell and not is_crypto(sym):
                 summary['skipped'].append((sym, 'too close to the bell'))
                 continue
-            if self.cooldown.get(sym, now) > now:
+            if self.cooldown.get(sym, now_et) > now_et:
                 summary['skipped'].append((sym, 'cooling down'))
                 continue
 
-            price = self._price(sym, sig['price'])
-            cash = self.budget.get_remaining_budget()
-            shares = int((cash / max(slots, 1)) / price)
-            if shares == 0 and price <= cash:
-                shares = 1
-            if shares == 0:
-                summary['skipped'].append((sym, f"${price:,.2f} > ${cash:,.2f} cash"))
-                continue
-            if not self.budget.can_trade(price * shares):
-                summary['skipped'].append((sym, 'over weekly budget'))
+            ref = self._price(sym, sig['price'])
+            qty, size_usd, _est_fill = self.budget.size_order(sym, ref, prices=prices, now=now)
+            if qty <= 0:
+                # size_order returns 0 when the slot is worth less than
+                # MIN_ORDER_USD; say which constraint bound.
+                bp = self.budget.get_buying_power(now=now)
+                summary['skipped'].append(
+                    (sym, 'insufficient buying power' if bp < min_order else 'below min order'))
                 continue
 
-            tid = self.budget.log_trade(sym, 'BUY', price, shares)
-            self.budget.execute_trade(tid)
-            self.entry_time[sym] = now
+            tid = self.budget.log_trade(sym, 'BUY', ref, qty,
+                                        probability=sig['probability'], now=now)
+            row = self.budget.execute_trade(tid, now=now)
+            if row is None:
+                logger.error(f"[fast] ENTER {sym}: trade #{tid} did not execute")
+                continue
+            self.entry_time[sym] = now_et
             summary['entries'].append({
-                'symbol': sym, 'shares': shares, 'price': price,
-                'probability': sig['probability'], 'cost': price * shares,
-                'trade_id': tid})
+                'symbol': sym, 'shares': qty, 'price': row['price'], 'ref_price': ref,
+                'probability': sig['probability'], 'cost': row['amount'],
+                'fees': row['fees'], 'trade_id': tid})
+            try:
+                signal_log.mark_executed(self.budget.conn, sym, sig['bar_ts'], tid)
+            except Exception as e:
+                logger.warning(f"[fast] could not mark signal {sym}@{sig.get('bar_ts')} "
+                               f"executed: {e}")
             slots -= 1
-            logger.info(f"[fast] ENTER {shares} {sym} @ ${price:,.2f} "
-                        f"(p={sig['probability']:.3f})")
+            logger.info(f"[fast] ENTER {costs.qty_str(qty)} {sym} @ ${row['price']:,.2f} "
+                        f"(ref ${ref:,.2f}, p={sig['probability']:.3f}) "
+                        f"cost ${row['amount']:,.2f}")
 
+        if summary['entries']:
+            # Entries moved cash; report the post-trade account, not the pre-trade one.
+            summary.update(self._account_fields(prices, now))
         if not summary['entries'] and not summary['exits']:
             summary['note'] = (f"{len(candidates)} candidate(s) over the "
                                f"{summary['bar']:.3f} bar; nothing actionable.")
