@@ -268,7 +268,9 @@ unconditionally (not only when intraday training succeeds). Each tick, with
 
 `build_scorecard(budget, engine, intraday, day) -> dict` lives in new
 `src/scorecard.py` with `wilson_ci(hits, n)` and `mean_ci(values)` (mean,
-SE, 95% normal interval with z=1.96 — scipy is not a dependency). `discord_bot._scorecard_embed(day)` renders it and is
+SE, 95% normal interval with z = 1.96 — scipy is not a declared dependency, and
+at the n ≥ 60 the GO rule requires t(0.975, 59) = 2.00 differs by 2%).
+`discord_bot._scorecard_embed(day)` renders it and is
 used by the 16:05 report, `/pnl` and `/summary`. `/stats` is removed
 (`get_statistics` deleted). The "Registered N slash commands" log count is
 updated. "Today" everywhere means the ET date (`trades.trade_date`).

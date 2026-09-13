@@ -28,7 +28,7 @@ with `OPENED_AT = 2026-09-01T00:00Z`.
 | 4 | account ledger | `src/budget_tracker.py`, `tests/test_budget_tracker.py` | 1, 2, 3 |
 | 5 | signal log | `src/signal_log.py`, `src/intraday_engine.py` (`signal()` bar_ts), `tests/test_signal_log.py` | 3 |
 | 6 | fast trader | `src/fast_trader.py`, `tests/test_fast_trader.py` | 1, 2, 4, 5 |
-| 7 | scorecard | `src/scorecard.py`, `tests/test_scorecard.py` | 4, 6 (8 for the live report) |
+| 7 | scorecard | `src/scorecard.py`, `tests/test_scorecard.py` | 4, 5, 6 (8 for the live report) |
 | 8 | benchmark | `src/ml_engine.py`, `tests/test_benchmark.py` | — |
 | 9 | discord | `src/discord_bot.py`, `tests/test_discord_embeds.py` | 4, 6, 7 |
 | 10 | config + deploy | `.env.example`, `configure.sh`, `README.md`, live `.env`, restart | all |
