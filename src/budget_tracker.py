@@ -174,6 +174,28 @@ class BudgetTracker:
         """Booked P&L before fees (= realized + fees)."""
         return self._sum_since_open('gross_pnl')
 
+    # --- sizing ----------------------------------------------------------
+
+    def size_order(self, symbol: str, ref_price: float, prices: dict | None = None,
+                   now: datetime | None = None) -> tuple[float, float, float]:
+        """(qty, size_usd, est_fill) for a BUY; qty is 0.0 when the order is too small.
+
+        Every entry is the same fraction of equity (equity / FAST_MAX_POSITIONS)
+        capped by buying power, so wins compound and losses shrink the next
+        order. Orders are dollar-based (qty = size_usd / estimated fill), so the
+        cash debit can never exceed buying power (6-dp qty rounding aside).
+        `prices` is the dict of quotes the same cycle already fetched for held
+        symbols - no second quote is taken for sizing.
+        """
+        buying_power = self.get_buying_power(now)
+        equity = self.get_equity(prices or {})
+        slots = int(os.getenv('FAST_MAX_POSITIONS', 4))
+        size_usd = min(buying_power, equity / slots)
+        est_fill = costs.fill(symbol, 'BUY', float(ref_price), 1)['fill_price']
+        if size_usd < float(os.getenv('MIN_ORDER_USD', 1)):
+            return 0.0, size_usd, est_fill
+        return round(size_usd / est_fill, 6), size_usd, est_fill
+
     # --- trade lifecycle -------------------------------------------------
 
     def log_trade(self, symbol: str, side: str, ref_price: float, qty: float, *,
@@ -323,6 +345,65 @@ class BudgetTracker:
             }
             for r in rows
         ]
+
+    def get_pnl(self, price_fn) -> dict:
+        """Mark open positions to market and roll up the whole account.
+
+        `price_fn(symbol)` returns a current price, or None when unavailable.
+        Those positions are listed as stale with pnl None (a data outage never
+        masquerades as break-even); for equity they are carried at avg_price
+        because the account needs one number.
+        """
+        positions, unrealized, cost_total, market_total, stale, prices = [], 0.0, 0.0, 0.0, [], {}
+
+        for pos in self.get_positions():
+            price = None
+            try:
+                price = price_fn(pos['symbol'])
+            except Exception as e:
+                logger.warning(f"price lookup failed for {pos['symbol']}: {e}")
+
+            if price is None:
+                stale.append(pos['symbol'])
+                positions.append({**pos, 'price': None, 'pnl': None, 'pnl_pct': None})
+                continue
+
+            prices[pos['symbol']] = price
+            market = price * pos['shares']
+            pnl = market - pos['cost_basis']
+            unrealized += pnl
+            cost_total += pos['cost_basis']
+            market_total += market
+            positions.append({
+                **pos,
+                'price': round(price, 2),
+                'market_value': round(market, 2),
+                'pnl': round(pnl, 2),
+                'pnl_pct': (pnl / pos['cost_basis']) if pos['cost_basis'] else 0.0,
+            })
+
+        realized = self.get_realized_pnl()
+        starting = self.starting_cash()
+        equity = self.get_equity(prices)
+        return {
+            'positions': positions,
+            'stale': stale,
+            'realized': realized,
+            'unrealized': unrealized,
+            'total': realized + unrealized,
+            'cost_basis': cost_total,
+            'market_value': market_total,
+            'cash': self.get_cash(),
+            'unsettled': self.get_unsettled(),
+            'buying_power': self.get_buying_power(),
+            'equity': equity,
+            'starting_cash': starting,
+            'all_time_net': equity - starting,
+            # a fraction, like pnl_pct: format with :+.2%
+            'all_time_pct': ((equity - starting) / starting) if starting else 0.0,
+            'fees_paid': self.get_fees_paid(),
+            'gross_pnl': self.get_gross_pnl(),
+        }
 
     def get_trades_since_open(self, day: str | None = None) -> list[sqlite3.Row]:
         """EXECUTED trades since the account opened, optionally for one ET trade_date."""

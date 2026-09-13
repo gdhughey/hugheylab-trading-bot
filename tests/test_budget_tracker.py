@@ -229,3 +229,114 @@ def test_dust_is_written_as_zero_and_hidden(bt):
         "SELECT shares, avg_price, entry_ref FROM positions WHERE symbol = 'DOGE-USD'").fetchone()
     assert raw['shares'] == 0.0 and raw['avg_price'] == 0.0 and raw['entry_ref'] == 0.0
     assert bt.get_positions() == []
+
+
+# --- sizing ----------------------------------------------------------------
+
+def test_size_order_is_fractional_and_dollar_based(bt):
+    qty, size_usd, est_fill = bt.size_order('AAPL', 100.0, now=FRI_1000)
+    assert est_fill == pytest.approx(100.05)
+    assert size_usd == pytest.approx(125.0)                 # 500 / FAST_MAX_POSITIONS
+    assert qty == round(125.0 / 100.05, 6) == 1.249375
+    assert qty * est_fill <= size_usd + 1e-3                # 6-dp qty rounding is the only slack
+
+
+def test_size_order_below_min_order_returns_zero_qty(bt, monkeypatch):
+    monkeypatch.setenv('MIN_ORDER_USD', '200')              # read at call time
+    qty, size_usd, est_fill = bt.size_order('AAPL', 100.0, now=FRI_1000)
+    assert qty == 0.0
+    assert size_usd == pytest.approx(125.0)
+    assert est_fill == pytest.approx(100.05)
+
+
+@pytest.mark.parametrize('symbols', [
+    ['AAPL', 'MSFT', 'NVDA', 'AMD'],
+    ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD'],
+])
+def test_filling_every_slot_from_500_never_overdraws(bt, symbols):
+    for sym in symbols:
+        bp = bt.get_buying_power(now=FRI_1000)
+        qty, size_usd, est_fill = bt.size_order(sym, 100.0, now=FRI_1000)
+        assert qty > 0
+        assert size_usd <= bp
+        row = _round_trip(bt, sym, 'BUY', 100.0, qty, FRI_1000)
+        assert row['amount'] <= bp + 1e-3                   # slippage is inside amount
+        assert bt.get_cash() >= -1e-3
+    assert len(bt.get_positions()) == 4
+    assert bt.get_cash() == pytest.approx(0.0, abs=1e-3)
+    # fully deployed: a fifth order is below MIN_ORDER_USD
+    qty, size_usd, _ = bt.size_order('TSLA', 100.0, now=FRI_1000)
+    assert qty == 0.0 and size_usd < 1.0
+
+
+def test_entry_fills_in_full_when_buying_power_binds(bt):
+    # Three stock round trips on Friday. Each SELL is profitable, so equity
+    # grows to ~$537, but in a cash account the proceeds stay unsettled until
+    # Monday - so buying power is only the $125 that never left. That puts
+    # buying power BELOW equity / FAST_MAX_POSITIONS (~$134): the next order
+    # must be capped at buying power and still fill in full there, not be
+    # skipped or overdraw.
+    for sym in ('AAPL', 'MSFT', 'NVDA'):
+        qty, _, _ = bt.size_order(sym, 100.0, now=FRI_1000)
+        _round_trip(bt, sym, 'BUY', 100.0, qty, FRI_1000)
+    for sym in ('AAPL', 'MSFT', 'NVDA'):
+        (pos,) = [p for p in bt.get_positions() if p['symbol'] == sym]
+        sell = _round_trip(bt, sym, 'SELL', 110.0, pos['shares'], FRI_1555, exit_reason='tp')
+        assert sell['realized_pnl'] > 0
+    assert bt.get_positions() == []
+    bp = bt.get_buying_power(now=FRI_1555)
+    equity = bt.get_equity({})
+    assert bt.get_unsettled(now=FRI_1555) > 400.0          # three SELLs' proceeds, held to Monday
+    assert bp == pytest.approx(125.0, abs=1e-3)             # the cash left after three $125 buys
+    assert equity > 530.0
+    assert bp < equity / 4                                  # buying power binds, not the equity slice
+    qty, size_usd, est_fill = bt.size_order('AMD', 100.0, now=FRI_1555)
+    assert size_usd == pytest.approx(bp)
+    assert qty == round(bp / est_fill, 6)
+    row = _round_trip(bt, 'AMD', 'BUY', 100.0, qty, FRI_1555)
+    assert row['amount'] == pytest.approx(bp, abs=1e-3)     # filled in full at the cap
+    assert bt.get_buying_power(now=FRI_1555) == pytest.approx(0.0, abs=1e-3)
+    assert bt.get_cash() > 400.0                            # unsettled proceeds are still cash
+    # Monday the proceeds settle and all of it is spendable again
+    assert bt.get_buying_power(now=MON_0930) == pytest.approx(bt.get_cash())
+
+
+def test_compounding_after_a_win_grows_the_next_order(bt):
+    qty1, size1, _ = bt.size_order('AAPL', 100.0, now=FRI_1000)
+    _round_trip(bt, 'AAPL', 'BUY', 100.0, qty1, FRI_1000)
+    sell = _round_trip(bt, 'AAPL', 'SELL', 120.0, qty1, FRI_1555, exit_reason='tp')
+    assert sell['realized_pnl'] > 0
+    # Monday, once the proceeds settle, equity has grown and so has the slice
+    qty2, size2, _ = bt.size_order('MSFT', 100.0, now=MON_0930)
+    assert bt.get_equity({}) == pytest.approx(bt.get_cash())
+    assert size2 == pytest.approx(bt.get_cash() / 4)
+    assert size2 > size1 and qty2 > qty1
+
+
+# --- get_pnl -----------------------------------------------------------------
+
+def test_get_pnl_keys_and_equity(bt):
+    _round_trip(bt, 'AAPL', 'BUY', 100.0, 1.0, FRI_1000)
+    _round_trip(bt, 'MSFT', 'BUY', 200.0, 0.5, FRI_1000)
+    quotes = {'AAPL': 110.0}                                # MSFT has no quote -> stale
+    pnl = bt.get_pnl(quotes.get)
+    assert set(pnl) == {
+        'positions', 'stale', 'realized', 'unrealized', 'total', 'cost_basis',
+        'market_value', 'cash', 'unsettled', 'buying_power', 'equity', 'starting_cash',
+        'all_time_net', 'all_time_pct', 'fees_paid', 'gross_pnl'}
+    assert 'return_pct' not in pnl
+    assert pnl['stale'] == ['MSFT']
+    assert pnl['cash'] == pytest.approx(500.0 - 100.05 - 0.5 * 200.1)
+    assert pnl['starting_cash'] == 500.0
+    assert pnl['unrealized'] == pytest.approx(110.0 - 100.05)
+    assert pnl['market_value'] == pytest.approx(110.0)
+    assert pnl['cost_basis'] == pytest.approx(100.05)
+    # the stale MSFT is carried at avg_price, so equity moves only with AAPL
+    assert pnl['equity'] == pytest.approx(pnl['cash'] + 110.0 + 0.5 * 200.1)
+    assert pnl['all_time_net'] == pytest.approx(pnl['equity'] - 500.0)
+    assert pnl['all_time_pct'] == pytest.approx(pnl['all_time_net'] / 500.0)
+    assert pnl['unsettled'] == 0.0 and pnl['buying_power'] == pytest.approx(pnl['cash'])
+    assert pnl['realized'] == 0.0 and pnl['fees_paid'] == 0.0 and pnl['gross_pnl'] == 0.0
+    assert pnl['total'] == pytest.approx(pnl['unrealized'])
+    assert [p['symbol'] for p in pnl['positions']] == ['AAPL', 'MSFT']
+    assert pnl['positions'][1]['price'] is None and pnl['positions'][1]['pnl'] is None
