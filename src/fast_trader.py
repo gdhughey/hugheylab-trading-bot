@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from src import costs, signal_log
+from src.database import connect
 from src.intraday_engine import (market_state, minutes_to_close, ET, INTERVAL,
                                  is_crypto, asset_class, barriers)
 
@@ -95,6 +96,15 @@ class FastTrader:
         self.engine = engine
         self.budget = budget_tracker
         self.quote_fn = quote_fn          # live price, falls back to bar close
+        # The signal log gets its OWN connection. budget.conn is written from
+        # two threads: this cycle (worker thread) and the Discord approval
+        # path (/buy, /sell -> budget.execute_trade on the event-loop thread).
+        # In autocommit mode a transaction belongs to the connection, so a
+        # `with budget.conn:` from here while the approval's BEGIN IMMEDIATE
+        # is open would commit its half-written trade (cash debited, position
+        # not yet booked). A separate connection waits on SQLite's write lock
+        # instead - the ordering the BudgetTracker docstring prescribes.
+        self._sig_conn = connect(self.budget.db_path)
         self.cooldown = {}                # symbol -> datetime it may be re-entered
         self.entry_time = {}              # symbol -> when we opened it
         self.last_summary = {}
@@ -295,13 +305,12 @@ class FastTrader:
         # Every scored symbol is logged every cycle (INSERT OR IGNORE on the
         # bar, so the 60 s poll cannot inflate n); candidates are the above-bar
         # rows, already ranked by margin over each class's own bar.
-        # The log writes go through budget.conn on THIS thread - the same
-        # worker thread that runs the ledger's transactions, so there is no
-        # cross-thread use of the connection (label_pending, which runs on the
-        # event-loop thread, opens its own connection).
+        # The log writes go through self._sig_conn, never budget.conn: the
+        # Discord approval path writes through budget.conn from the event-loop
+        # thread, and a commit from here could land mid-trade (see __init__).
         signals = self.engine.scan_all()
         try:
-            signal_log.record(self.budget.conn, signals, now=now)
+            signal_log.record(self._sig_conn, signals, now=now)
         except Exception as e:
             # The log is measurement, not trading - never let it stop a cycle.
             logger.warning(f"[fast] signal log write failed: {e}")
@@ -366,7 +375,7 @@ class FastTrader:
                 'probability': sig['probability'], 'cost': row['amount'],
                 'fees': row['fees'], 'trade_id': tid})
             try:
-                signal_log.mark_executed(self.budget.conn, sym, sig['bar_ts'], tid)
+                signal_log.mark_executed(self._sig_conn, sym, sig['bar_ts'], tid)
             except Exception as e:
                 logger.warning(f"[fast] could not mark signal {sym}@{sig.get('bar_ts')} "
                                f"executed: {e}")

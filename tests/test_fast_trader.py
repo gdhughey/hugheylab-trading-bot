@@ -468,3 +468,75 @@ def test_closed_market_without_crypto_returns_early(tmp_path, monkeypatch):
     assert s['unsettled'] == 0
     assert signal_count(budget) == 0
     assert budget.get_day_state('2026-09-12') is None
+
+
+# --- signal log must not share the ledger's transaction ----------------------
+
+class _Abort(Exception):
+    """Raised inside the simulated Discord transaction so _txn rolls it back."""
+
+
+def test_signal_log_never_commits_a_ledger_transaction_open_on_another_thread(
+        tmp_path, monkeypatch):
+    """The Discord approval path (/buy, /sell) calls budget.execute_trade from
+    the event-loop thread while the cycle runs in a worker thread. If the
+    cycle wrote the signal log through budget.conn, signal_log's `with conn:`
+    would commit whatever that other transaction had half-written (cash
+    debited, position not yet booked). Simulate exactly that: another thread
+    is inside budget._txn() with an uncommitted cash debit at the moment the
+    cycle reaches scan_all; the cycle's signal-log write must neither commit
+    that debit nor land its rows inside that transaction.
+    """
+    import threading
+    import time
+
+    budget = make_budget(tmp_path, monkeypatch)
+    engine = FakeEngine(['BTC-USD'], {'BTC-USD': 100.0})
+    trader = make_trader(engine, budget)
+
+    txn_open = threading.Event()
+    seen = {}
+
+    def discord_thread():
+        # Mirrors execute_trade: locked BEGIN IMMEDIATE on budget.conn, a cash
+        # debit, then (here) a failure that must roll the debit back.
+        try:
+            with budget._txn():
+                budget.conn.execute("UPDATE account SET cash = cash - 100 WHERE id = 1")
+                txn_open.set()
+                time.sleep(0.5)            # the cycle's signal-log write happens now
+                seen['signals_inside_txn'] = budget.conn.execute(
+                    "SELECT COUNT(*) FROM signals").fetchone()[0]
+                seen['in_transaction'] = budget.conn.in_transaction
+                raise _Abort
+        except _Abort:
+            pass
+
+    real_scan_all = engine.scan_all
+
+    def scan_all_with_concurrent_approval():
+        t = threading.Thread(target=discord_thread)
+        t.start()
+        assert txn_open.wait(5), "simulated approval never opened its transaction"
+        seen['thread'] = t
+        return real_scan_all()
+
+    engine.scan_all = scan_all_with_concurrent_approval
+
+    # Saturday + crypto-only universe: the cycle runs (crypto keeps it alive),
+    # records the scan, and has no entries (crypto is cost-gated), so the only
+    # ledger write after scan_all is the signal log's own.
+    s = trader.cycle(now=SATURDAY)
+    seen['thread'].join(5)
+    assert not seen['thread'].is_alive()
+
+    assert ('BTC-USD', 'class gated: blocked: take-profit 0.60% is below the '
+                       '1.20% round-trip cost') in s['skipped']
+    # The other thread's transaction was still open and untouched by the
+    # cycle: no signal rows inside it, and not committed under its feet.
+    assert seen['in_transaction'] is True
+    assert seen['signals_inside_txn'] == 0
+    assert budget.get_cash() == pytest.approx(500.0)        # the debit rolled back
+    assert not budget.conn.in_transaction
+    # The signal log itself still landed, on its own connection.
+    assert signal_count(budget) == 1

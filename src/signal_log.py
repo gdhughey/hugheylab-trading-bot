@@ -9,13 +9,17 @@ report labels each row with the SAME triple-barrier rule the model was trained
 on. That gives ~40 labelled signals a day, enough for a real confidence
 interval by the review date.
 
-Connection ownership. record() and mark_executed() run on the fast cycle's
-thread, sequentially with BudgetTracker._txn(), so they may share
-budget.conn. label_pending() runs on the 16:05 report's worker thread while
-the cycle may be mid-transaction on budget.conn (crypto keeps the cycle alive
-after the bell); its `with conn:` commit would then commit the cycle's
-half-finished trade. Callers pass it a connection BudgetTracker does not own
-(IntradayEngine.conn, or a fresh connect(path)).
+Connection ownership. Nothing here may run on budget.conn. Every function
+ends with a `with conn:` block, whose commit belongs to the CONNECTION, not
+to the calling thread - and budget.conn is written from two threads: the fast
+cycle's worker thread and the Discord approval path (/buy, /sell ->
+budget.execute_trade on the event-loop thread), each inside a locked
+BEGIN IMMEDIATE. A commit from here while either has a transaction open
+would land mid-trade (cash debited, position not yet booked). So
+FastTrader gives record()/mark_executed() their own connection
+(FastTrader._sig_conn), and label_pending() - the 16:05 report's worker
+thread - gets one BudgetTracker does not own (IntradayEngine.conn, or a
+fresh connect(path)).
 """
 
 import logging
@@ -137,7 +141,8 @@ def label_pending(conn, now=None) -> int:
 
     `conn` must not be BudgetTracker.conn: this runs on the report's worker
     thread and its commit would land on whatever transaction the fast cycle
-    has open on that connection (see the module docstring).
+    or a Discord approval has open on that connection (see the module
+    docstring).
     """
     now = now or datetime.now(timezone.utc)
     pending = conn.execute(
