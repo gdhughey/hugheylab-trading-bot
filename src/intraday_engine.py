@@ -565,6 +565,9 @@ class IntradayEngine:
             'probability': p_up,
             'bar': self.threshold(cls),
             'price': float(h['close'].iloc[-1]),
+            # UTC ISO of the bar scored - the signal log's dedupe key, so the
+            # 60 s poll writes one row per 5m bar instead of five.
+            'bar_ts': h.index[-1].isoformat(),
             'bar_time': h.index[-1].astimezone(ET).strftime('%H:%M ET'),
             'bar_age_min': age_min,
         }
