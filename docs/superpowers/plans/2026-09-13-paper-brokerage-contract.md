@@ -8,6 +8,15 @@ under a heading "Contract additions" — never rename anything below.
 Repo: `/home/gdhughey/hugheylab-trading-bot`. Tests: `dev/ct-test.sh [pytest args]`
 (pushes the tree to LXC 200 and runs pytest in the production venv; the pve
 host has no sklearn/pandas/discord). Tests use a file DB under `tmp_path`.
+Clock rule: any test that constructs `Database()` and then reads anything
+filtered by `account.opened_at` (`get_unsettled`, `get_buying_power`,
+`get_fees_paid`, `get_realized_pnl`, `get_gross_pnl`, `get_trades_since_open`,
+`build_scorecard`) MUST either pass `Database(path, now=<fixed UTC datetime
+earlier than every trade stamp>)` or pin `opened_at` with
+`UPDATE account SET opened_at = ?`. An unpinned `opened_at` is the wall clock
+and silently excludes fixed-date trades once the real date passes them.
+`tests/test_fast_trader.py::make_budget` uses `Database(path, now=OPENED_AT)`
+with `OPENED_AT = 2026-09-01T00:00Z`.
 
 ## Task order and dependencies
 
