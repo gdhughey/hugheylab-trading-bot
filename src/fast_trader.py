@@ -17,10 +17,17 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 
-from src.intraday_engine import (market_state, minutes_to_close, ET,
+from src import costs, signal_log
+from src.intraday_engine import (market_state, minutes_to_close, ET, INTERVAL,
                                  is_crypto, asset_class, barriers)
 
 logger = logging.getLogger(__name__)
+
+# Barrier comparisons carry a tolerance because decimal quotes are not exact in
+# binary: (99.40 - 100) / 100 evaluates to -0.005999999999999943, which a bare
+# `<= -0.006` would NOT treat as a stop hit even though the quote sits exactly
+# on the barrier. 1e-9 is far below any tick and far above float error.
+BARRIER_EPS = 1e-9
 
 
 def _cfg(name, default, cast=float):
@@ -28,6 +35,57 @@ def _cfg(name, default, cast=float):
         return cast(os.getenv(name, default))
     except (TypeError, ValueError):
         return cast(default)
+
+
+def _interval_minutes(interval=None) -> float:
+    """Bar length in minutes for a yfinance interval string: '5m' -> 5, '1h' -> 60."""
+    s = str(interval or INTERVAL).strip().lower()
+    try:
+        return float(s[:-1]) * 60 if s.endswith('h') else float(s.rstrip('m'))
+    except ValueError:
+        return 5.0
+
+
+def max_hold_min(cls: str) -> float:
+    """Max hold per class = the label horizon in minutes (24 bars x 5m = 120).
+
+    Derived, not configured: the model was trained to call a move within this
+    window, so holding longer is a bet it never made.
+    """
+    return barriers(cls)[2] * _interval_minutes()
+
+
+def class_gate(cls: str, metrics: dict | None) -> tuple[bool, str]:
+    """(tradeable, text) for one asset class. `metrics` is that class's entry
+    from engine.metrics (None when there is no model; treated as EV 0).
+
+    Evaluated in this order:
+      1. cost gate - never bypassed: with a take-profit at or below the
+         round-trip cost no trade can be net positive;
+      2. EV gate - the backtest's verdict, blocks unless FAST_IGNORE_EV;
+      3. FAST_IGNORE_EV text - trading on paper despite a sub-floor EV;
+      4. ok text.
+    `ev` in metrics is a fraction (0.0006 = 0.06%), printed as a percentage.
+    """
+    tp, _sl, _horizon = barriers(cls)
+    cost = costs.round_trip_cost(cls)
+    if tp <= cost:
+        return False, (f"blocked: take-profit {tp:.2%} is below the "
+                       f"{cost:.2%} round-trip cost")
+    floor = _cfg('MIN_EV_TO_TRADE', 0.003)
+    ev = float((metrics or {}).get('ev', 0.0))
+    ignore_ev = os.getenv('FAST_IGNORE_EV', '0') in ('1', 'true', 'yes')
+    if ev < floor and not ignore_ev:
+        if ev > 0:
+            return False, (f"Not trading. Edge of {ev * 100:+.3f}% per trade is "
+                           f"real but smaller than the {floor:.2%} it costs to get "
+                           f"in and out, so it would lose money after fees.")
+        return False, (f"Not trading. Model loses money ({ev * 100:+.3f}% per "
+                       f"trade) on these settings.")
+    if ev < floor:
+        return True, (f"trading on paper despite EV {ev * 100:+.3f}% below the "
+                      f"{floor:.2%} floor (FAST_IGNORE_EV on)")
+    return True, f"Trading. Edge clears the {floor:.2%} cost floor"
 
 
 class FastTrader:
@@ -77,8 +135,6 @@ class FastTrader:
     def eod_flatten_min(self): return _cfg('FAST_EOD_FLATTEN_MIN', 10)
     @property
     def cooldown_min(self): return _cfg('FAST_COOLDOWN_MIN', 15)
-    @property
-    def max_hold_min(self): return _cfg('FAST_MAX_HOLD_MIN', 120)
 
     def _price(self, symbol, fallback):
         if self.quote_fn:
