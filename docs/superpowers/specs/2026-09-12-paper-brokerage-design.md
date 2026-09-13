@@ -340,8 +340,9 @@ argument; tests never rely on wall-clock time.
 - sizing: fractional qty; `size_usd < MIN_ORDER_USD` → no order; from a
   fresh $500 account filling all `FAST_MAX_POSITIONS` slots, every net debit
   ≤ buying power with slippage applied and cash ≥ 0 (stock and crypto);
-  third entry when buying power binds fills in full; compounding after a
-  win.
+  an entry when buying power binds (unsettled proceeds leave it below
+  equity / FAST_MAX_POSITIONS) fills in full at buying power; compounding
+  after a win.
 - barriers ref-to-ref: crypto BUY at ref 100 (fill 100.60) → cycle at ref
   100 no exit; at 99.61 no exit; at 99.60 stop fires, fills 99.60 × 0.994,
   `realized_pnl` per unit = fill − 100.60 (≈ −1.19% of cost). Stock BUY at
