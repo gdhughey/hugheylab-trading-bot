@@ -16,7 +16,7 @@ candidates on Discord, and records a trade only after you react ✅.
 | **Model** | Pooled `GradientBoostingClassifier` over 10 ratio/z-score features |
 | **Cadence** | Hourly: refresh prices → score all 503 → alert the top N |
 | **Approval** | Discord ✅ / ❌ reactions, or `AUTO_TRADE=1` to execute and report |
-| **Ledger** | SQLite — trades, positions, realized P&L |
+| **Ledger** | SQLite — one simulated cash account, trades with modelled fills and fees, positions, T+1 settlement, daily equity history, signal log |
 
 ## Data sources
 
@@ -127,12 +127,12 @@ and freed capital is reusable in the same pass:
 
 | Rule | Default |
 |---|---|
-| Take profit | +1.5% |
-| Stop loss | −1.0% |
+| Take profit | +1.0% stocks / +0.6% crypto (tuned, `data/tuned.json`) |
+| Stop loss | −0.6% stocks / −0.4% crypto (tuned) |
 | End-of-day flatten | 10 min before the bell |
-| Max hold | 120 min |
+| Max hold | label horizon × bar interval (24 × 5m = 120 min); not a setting |
 | Re-entry cooldown | 15 min |
-| Max concurrent positions | 3 |
+| Max concurrent positions | 3 (`FAST_MAX_POSITIONS`) |
 
 Stock trading happens only during the regular session (09:30–16:00 ET,
 weekdays). **Crypto (`TRADE_CRYPTO=1`) trades 24/7** — it produces ~3.7× the bars
@@ -155,9 +155,13 @@ The pooled number was an average hiding a strong stock model and a weak crypto
 one. Symbols are ranked by *margin over their own class bar*, since raw
 probabilities are not comparable across models with different base rates.
 
-**A class whose measured EV is negative is not traded at all** — `/fast` shows
-it as blocked. Exits still run on a blocked class, so an open position is never
-stranded.
+**Two gates decide whether a class may open positions** (`class_gate` in
+`src/fast_trader.py`, evaluated in this order): a *cost gate* — the take-profit
+must exceed the class's round-trip cost, never bypassed — and an *EV gate* —
+the backtested EV must clear `MIN_EV_TO_TRADE`, bypassed by `FAST_IGNORE_EV=1`
+for the paper run (see "Paper account" below). `/fast` and the startup notice
+name a blocked class and why. Exits still run on a blocked class, so an open
+position is never stranded.
 
 ### Tuning (`tune.py`)
 
@@ -184,13 +188,88 @@ capped at 60 days, breadth is the only way to add data.
 window at a high selection bar. Walk-forward validation across several windows
 is the real test, and is not yet implemented.
 
-### Budget accounting
+### Paper account
 
-`BUDGET_MODE=deployed` (default) caps **capital at risk** — the cost basis of
-open positions — and selling frees it again. The original `cumulative` mode
-capped total buy volume for the week and never refunded it, which halts a
-day-trading loop after a handful of round trips: recycling the same $100 ten
-times "spends" $1,000 against a $500 cap despite never risking more than $100.
+Paper mode models one **$500 retail cash brokerage account** (Robinhood-style:
+zero stock commissions, fractional shares, a per-side crypto markup) closely
+enough that two months of results are a fair basis for a go/no-go decision on
+real money. Every assumption is a setting (table at the end of this section).
+
+**Account.** One row in the `account` table, seeded from `STARTING_CASH` on the
+first start and never reset — there is no setter, because changing starting
+cash mid-run would corrupt the all-time return. Cash falls on BUY by
+fill × qty + fees and rises on SELL by fill × qty − fees. Equity = cash + market
+value of open positions. Every report counts only trades with
+`created_at >= account.opened_at`; older rows stay in the DB but are ignored.
+
+**Buying power** = cash − unsettled proceeds − pending BUYs. With
+`ACCOUNT_TYPE=cash` (default) a stock sale's proceeds are unsettled until the
+next trading day's 09:30 ET (T+1, weekends and `US_HOLIDAYS_2026` skipped);
+crypto settles immediately. `ACCOUNT_TYPE=margin` removes the wait and changes
+nothing else.
+
+**Fills and costs** (`src/costs.py`, applied in exactly one place,
+`BudgetTracker.log_trade`):
+
+| | Fill | Fees |
+|---|---|---|
+| Stock | ref × (1 ± `STOCK_SLIPPAGE_BPS`/1e4), 5 bps default | BUY none; SELL `SEC_FEE_RATE` × proceeds + min(`FINRA_TAF_PER_SHARE` × qty, `FINRA_TAF_CAP`) |
+| Crypto | ref × (1 ± `CRYPTO_SPREAD_BPS`/1e4) per side, 60 bps default | none |
+
+Round-trip cost: stocks ≈ 0.1%, crypto 1.2%. The crypto take-profit (0.6%) is
+below its round-trip cost, so the cost gate blocks crypto entries at the
+defaults; lower `CRYPTO_SPREAD_BPS` for a cheaper venue and it re-enables.
+
+**Sizing.** Every entry is `min(buying power, equity / FAST_MAX_POSITIONS)`
+dollars as a fractional quantity, skipped below `MIN_ORDER_USD`. Wins compound;
+losses shrink the next order.
+
+**Barriers are measured reference-to-reference** — the quote at entry against
+the quote now, the same move the labels use — so costs show up in cash and P&L,
+never in the stop trigger. Max hold is the label horizon × bar interval
+(24 × 5m = 120 min); `FAST_MAX_HOLD_MIN` no longer exists.
+
+**Daily loss limit.** Once equity is down `DAILY_LOSS_LIMIT_PCT` (3%) from the
+day's starting equity, no new positions open for the rest of the ET day. Exits
+still run. Announced once on Discord.
+
+**Daily report.** At 16:05 ET every day (weekends included) the bot labels the
+day's logged signals, writes the day's `equity_history` row, and posts one
+scorecard: all-time P&L with n and a 95% CI, a GO / NO-GO / EXTEND verdict per
+class, gross P&L and fees, balance, buying power, unsettled cash, today's
+trades, open positions, win rate with a Wilson CI, profit factor, max drawdown,
+per-class realised vs backtested precision, and SPY buy-and-hold on the same
+starting cash as context. `/pnl` and `/summary` show the same scorecard on
+demand.
+
+**Decision rule** (`src/scorecard.py: verdict`, pre-registered and frozen at
+`account.opened_at`; review 2026-11-13). Per class, with cost-adjusted
+breakeven `be_c = (sl + c) / (tp + sl)` and `[lo, hi]` the Wilson 95% CI of the
+live signal TP-first rate (n ≈ 40 signals/day — the executed-trade sample is
+too small to decide anything):
+
+- **NO-GO** if `hi < be_c`, or the cost gate blocks the class.
+- **GO** if `lo > be_c`, the day-clustered lower bound also clears `be_c`, at
+  least 60 trades executed, and the realised mean net return is within one SE
+  of the backtested EV net of costs.
+- **EXTEND** otherwise — treated as NO-GO for real money until it turns GO.
+
+`FAST_IGNORE_EV=1` (set for the paper run) lets a class trade on paper even
+when its backtested EV is below `MIN_EV_TO_TRADE`: the point of the run is to
+test whether live behaviour matches the backtest, not to overturn it. The cost
+gate is never bypassed.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `STARTING_CASH` | `500` | seeded once on first start; no setter |
+| `ACCOUNT_TYPE` | `cash` | `cash` = T+1 stock settlement; `margin` = none |
+| `STOCK_SLIPPAGE_BPS` | `5` | per side |
+| `CRYPTO_SPREAD_BPS` | `60` | per side; round trip 120 bps |
+| `SEC_FEE_RATE` | `0.0000206` | stock sells, on proceeds |
+| `FINRA_TAF_PER_SHARE` | `0.000195` | stock sells, capped by `FINRA_TAF_CAP` (`9.79`) |
+| `MIN_ORDER_USD` | `1` | smallest order |
+| `DAILY_LOSS_LIMIT_PCT` | `3` | account-wide, per ET day |
+| `FAST_IGNORE_EV` | `0` | `1` on the paper run |
 
 ## ⛔ Read this first: this model has no measured edge
 
@@ -256,16 +335,15 @@ Sell signals on stocks you do not own are filtered out — there is no short sid
 
 | Command | What it does |
 |---|---|
-| `/status` | Budget and open positions |
+| `/status` | Balance, buying power and open positions |
 | `/scan [top]` | Rank the whole universe right now |
-| `/pnl` | Mark the paper portfolio to market |
-| `/budget [amount]` | Check or set the weekly budget |
-| `/stats` | Executed / rejected counts, approval rate, realized P&L |
+| `/pnl` | The scorecard now: all-time P&L, verdicts, positions marked to market |
+| `/account` | Balance, cash, unsettled, buying power, starting cash, opened |
 | `/daily_brief` | Claude market commentary (optional) |
 | `/risk_check` | Claude risk read on open positions (optional) |
 | `/retrain` | Refresh all sources and retrain (~4 min) |
-| `/fast` | Intraday model stats, exit rules, and live scores |
-| `/summary` | Today's results and tomorrow's game plan |
+| `/fast` | Intraday model stats, exit rules, gates, and live scores |
+| `/summary` | The same scorecard the 16:05 ET report posts |
 | `/sources` | Where market data is coming from, and last refresh counts |
 | `/pause` · `/resume` | Stop or restart the loop |
 
@@ -273,20 +351,21 @@ Sell signals on stocks you do not own are filtered out — there is no short sid
 
 Every hour it posts a plain-English report, so silence is never ambiguous:
 
-- **💰 Your money** — budget, cash left, what your holdings are worth, up/down in
-  dollars and percent
+- **💰 Your money** — balance vs starting cash, buying power, unsettled cash,
+  what your holdings are worth, up/down in dollars and percent
 - **📊 What you own** — per position: what you paid, what it's worth now, gain/loss
 - **👉 What to do** — in plain words: react to an alert, or nothing, and why
 - **🔍 What I checked** — how many symbols, from where, how many were buys vs sells
 
 Set `HEARTBEAT=0` to turn it off.
 
-### Daily wrap
+### Daily report
 
-After the close it posts one summary: what was booked today, every position
-closed, anything held overnight (crypto only — stocks are flattened), and a game
-plan for tomorrow with each model's EV, available budget, and when trading
-resumes. `/summary` runs it on demand.
+At 16:05 ET every day (weekends included, so a quiet Saturday still gets an
+equity row) it labels the day's logged signals, records the day's equity, and
+posts the scorecard described under "Paper account". A failed post is retried
+every 5 minutes; `day_state.report_posted_at` guarantees at most one post per
+date, even across the nightly restart. `/summary` shows it on demand.
 
 ## Retraining manually
 
@@ -341,7 +420,8 @@ All via `.env` (see `.env.example`):
 | `DISCORD_TOKEN` | — | required |
 | `USER_ID` | — | required; who may approve trades |
 | `CHANNEL_ID` | *blank* | blank = DM you |
-| `WEEKLY_BUDGET` | `5000` | small budgets skip expensive stocks; a 1-share floor applies |
+| `STARTING_CASH` | `500` | seeded into the paper account on first start; no setter |
+| `ACCOUNT_TYPE` | `cash` | `cash` = T+1 stock settlement; `margin` = none |
 | `UNIVERSE` | `default` | `sp500`, `default` (5 tickers), or a comma list |
 | `MIN_PROBABILITY` | `0.55` | confidence bar |
 | `MAX_ALERTS_PER_CYCLE` | `3` | caps DMs per hour |
@@ -358,8 +438,8 @@ All via `.env` (see `.env.example`):
   respond". Check with `journalctl -u trading-bot | grep -i "heartbeat blocked"`.
 - Slash handlers must `defer()` immediately — Discord kills an unacknowledged
   interaction after 3 seconds.
-- Pending trades hold budget. They are rolled back if the alert fails to send,
-  and cleared at startup, since their approval watcher lives in memory.
+- Pending trades hold buying power. They are rolled back if the alert fails to
+  send, and cleared at startup, since their approval watcher lives in memory.
 
 ## License
 
