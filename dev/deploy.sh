@@ -29,10 +29,24 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
 fi
 rev=$(git rev-parse --short HEAD)
 
+# The .env is excluded from the tar, so the paper-account keys the contract
+# adds (and the three it removes) have to be edited in place. The script only
+# appends what is missing and deletes what is dead; it never touches a
+# secret, and it prints the effective FAST_IGNORE_EV because that is the one
+# key whose code default (0) would leave the paper account never trading.
+echo "==> migrating $APP/.env"
+sudo pct exec "$CT" -- bash -s "$APP/.env" < dev/env-migrate.sh
+
 echo "==> shipping $rev to CT $CT:$APP"
 tar czf - "${EXCLUDES[@]}" . | sudo pct exec "$CT" -- tar xzf - -C "$APP"
 
 echo "==> restarting trading-bot"
 sudo pct exec "$CT" -- systemctl restart trading-bot
 sudo pct exec "$CT" -- systemctl is-active trading-bot
-echo "==> follow it with: sudo pct exec $CT -- journalctl -u trading-bot -f"
+cat <<EOF
+==> follow it with: sudo pct exec $CT -- journalctl -u trading-bot -f
+    expect the startup notice to say "Trading is LIVE" with the stock line
+    "trading on paper despite EV ... (FAST_IGNORE_EV on)"
+==> then confirm the ledger opened: dev/ct-sql.sh "select * from account"
+    one row: starting_cash 500 / cash 500 / account_type cash
+EOF
