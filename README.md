@@ -1,5 +1,7 @@
 # Hugheylab Trading Bot
 
+> **Want to read the whole bot in one place?** [`docs/CODE.md`](docs/CODE.md) has every source file on a single page, with a table of contents.
+
 Scans the S&P 500 hourly with a gradient-boosting model, DMs you the strongest
 candidates on Discord, and records a trade only after you react ✅.
 
