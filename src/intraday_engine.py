@@ -14,7 +14,7 @@ Deliberately narrow: a small, liquid universe so a full refresh takes seconds.
 import os
 import json
 import logging
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -151,8 +151,39 @@ def fast_universe():
 US_HOLIDAYS_2026 = {
     '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25',
     '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+    # 2027-01-01 is here so a SELL on 2026-12-31 settles on Mon 2027-01-04,
+    # not on the holiday Friday. The paper run reviews on 2026-11-13, but the
+    # service keeps running past year end.
+    '2027-01-01',
 }
 EARLY_CLOSE_2026 = {'2026-11-27', '2026-12-24'}   # 13:00 ET
+
+
+def is_trading_day(d: date) -> bool:
+    """True when the US stock market is open at all on calendar date d.
+
+    Early-close days count as trading days. strftime (not isoformat) so a
+    datetime passed by mistake still compares as a bare date.
+    """
+    return d.weekday() < 5 and d.strftime('%Y-%m-%d') not in US_HOLIDAYS_2026
+
+
+def next_trading_day_open(ts: datetime) -> datetime:
+    """09:30 ET on the first trading day STRICTLY after ts's ET calendar date.
+
+    ts must be tz-aware (any zone); it is converted to ET before the date is
+    taken, because a Monday-evening SELL logged as Tuesday 02:00 UTC still
+    settles Tuesday, not Wednesday (T+1 for a cash account). Returns a
+    tz-aware ET datetime; callers that store it convert to UTC ISO themselves.
+    A naive ts raises ValueError: astimezone() would read it as system-local
+    time and silently produce a plausible-looking wrong settlement date.
+    """
+    if ts.tzinfo is None or ts.utcoffset() is None:
+        raise ValueError('next_trading_day_open needs a tz-aware datetime')
+    d = ts.astimezone(ET).date() + timedelta(days=1)
+    while not is_trading_day(d):
+        d += timedelta(days=1)
+    return datetime.combine(d, dtime(9, 30), tzinfo=ET)
 
 
 def market_state(now=None, symbol=None):
@@ -163,11 +194,12 @@ def market_state(now=None, symbol=None):
     if symbol and is_crypto(symbol):
         return 'open', '24/7 crypto'
     now = (now or datetime.now(ET)).astimezone(ET)
-    if now.weekday() >= 5:
-        return 'closed', 'weekend'
+    if not is_trading_day(now.date()):
+        # Same calendar as settlement (next_trading_day_open) so the two can
+        # never disagree about whether today counts; the description is kept
+        # because the Discord status line prints it.
+        return 'closed', 'weekend' if now.weekday() >= 5 else 'market holiday'
     day = now.strftime('%Y-%m-%d')
-    if day in US_HOLIDAYS_2026:
-        return 'closed', 'market holiday'
     t = now.time()
     close = dtime(13, 0) if day in EARLY_CLOSE_2026 else dtime(16, 0)
     if dtime(9, 30) <= t < close:
@@ -533,6 +565,9 @@ class IntradayEngine:
             'probability': p_up,
             'bar': self.threshold(cls),
             'price': float(h['close'].iloc[-1]),
+            # UTC ISO of the bar scored - the signal log's dedupe key, so the
+            # 60 s poll writes one row per 5m bar instead of five.
+            'bar_ts': h.index[-1].isoformat(),
             'bar_time': h.index[-1].astimezone(ET).strftime('%H:%M ET'),
             'bar_age_min': age_min,
         }

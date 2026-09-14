@@ -49,6 +49,12 @@ UNIVERSE = os.getenv('UNIVERSE', 'default')
 DEFAULT_SYMBOLS = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN']
 BATCH_SIZE = int(os.getenv('FETCH_BATCH_SIZE', 60))
 
+# Fetched alongside the universe so the daily scorecard can quote SPY
+# buy-and-hold for context, but never trained on or scanned:
+# fetch_and_store_data keeps them out of self.symbols and _stored_symbols()
+# filters them out of the training list.
+BENCHMARK_SYMBOLS = ['SPY']
+
 TARGET_MODE = os.getenv('TARGET_MODE', 'next_day')
 FORWARD_DAYS = int(os.getenv('FORWARD_DAYS', 5))
 FORWARD_THRESHOLD = float(os.getenv('FORWARD_THRESHOLD', 0.025))
@@ -172,7 +178,11 @@ class TradingSignalEngine:
         symbols that already resolved.
         """
         self.symbols = list(symbols) if symbols else (self.symbols or load_universe())
-        pending = list(self.symbols)
+        # Benchmarks ride along in the same provider batches (one extra name
+        # per request) but never enter self.symbols, so training and scanning
+        # do not see them. A caller that lists SPY itself is not asked twice.
+        pending = [s for s in BENCHMARK_SYMBOLS if s not in self.symbols] + list(self.symbols)
+        requested = len(pending)
         total = 0
         self.source_stats = {}
 
@@ -206,7 +216,9 @@ class TradingSignalEngine:
                            f"{', '.join(pending[:8])}{'...' if len(pending) > 8 else ''}")
             self.source_stats['unresolved'] = {'symbols': len(pending), 'rows': 0}
 
-        logger.info(f"Stored {total} rows across {len(self.symbols) - len(pending)} symbols "
+        # `requested` rather than len(self.symbols): the benchmark names were
+        # fetched too, and the count would otherwise go negative-looking short.
+        logger.info(f"Stored {total} rows across {requested - len(pending)} symbols "
                     f"via {len([p for p in self.providers if p.provides_history])} source(s)")
         return total
 
@@ -244,7 +256,10 @@ class TradingSignalEngine:
 
     def _stored_symbols(self) -> list:
         rows = self.conn.execute("SELECT DISTINCT symbol FROM prices").fetchall()
-        return [r['symbol'] for r in rows]
+        # Benchmarks live in `prices` for the daily report only; feeding the
+        # index itself to the pooled model would just teach it what the
+        # market did.
+        return [r['symbol'] for r in rows if r['symbol'] not in BENCHMARK_SYMBOLS]
 
     # --- training --------------------------------------------------------
 
@@ -341,6 +356,23 @@ class TradingSignalEngine:
             return float(row['close']) if row else None
         except Exception:
             return None
+
+    def first_close_on_or_after(self, symbol: str, date_iso: str):
+        """Earliest stored daily close dated `date_iso` or later, else None.
+
+        The scorecard's SPY buy-and-hold line starts the day the paper account
+        opened; if that fell on a weekend or holiday, the first bar after it
+        is the price a buy-and-hold investor would actually have paid.
+        `date_iso` may be a bare date or a full ISO timestamp (account.opened_at)
+        - only the date part is compared, because 'YYYY-MM-DDTHH:MM' sorts
+        after 'YYYY-MM-DD' and would silently skip that day's bar.
+        """
+        row = self.conn.execute(
+            "SELECT close FROM prices WHERE symbol = ? AND date >= ? "
+            "ORDER BY date ASC LIMIT 1",
+            (symbol, date_iso[:10]),
+        ).fetchone()
+        return float(row['close']) if row else None
 
     def latest_price(self, symbol: str):
         """Live quote if any provider can give one, else the last stored close.

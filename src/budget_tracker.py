@@ -1,225 +1,486 @@
 #!/usr/bin/env python3
 """
-Budget tracker - enforces the weekly spend cap and records trade lifecycle.
+Budget tracker - the paper brokerage ledger: one cash account, the positions
+it holds, and the trade lifecycle (PENDING -> EXECUTED | REJECTED).
 
-Budget semantics (BUDGET_MODE):
-  * "deployed" (default): the budget caps CAPITAL AT RISK - the cost basis of
-    currently open positions. Selling frees it again. This is the right meaning
-    for a day-trading loop, where the same $100 may be recycled many times a
-    day; under the cumulative rule that loop would exhaust a $500 weekly cap
-    after five round trips despite never risking more than $100.
-  * "cumulative": the original meaning - total BUY volume booked this week,
-    never refunded by a sale. Appropriate for buy-and-hold, not for day trading.
-  * "Committed" = EXECUTED + PENDING. can_trade()/get_remaining_budget() work
-    against committed spend so that trades awaiting Discord approval cannot
-    collectively overshoot the weekly cap.
-  * get_weekly_spent() reports EXECUTED spend only - that is what actually left
-    the account, and it is what the Discord embeds label "Spent".
+Account semantics:
+  * One `account` row (seeded by Database._migrate) holds `cash`. A BUY debits
+    `amount` (fill x qty + fees); a SELL credits `amount` (fill x qty - fees).
+    Cash never resets, so wins compound and losses shrink the next order.
+  * Equity = cash + market value of open positions. A symbol without a quote
+    is carried at its avg_price (and reported as stale by get_pnl).
+  * Buying power = cash - unsettled SELL proceeds - `amount` of PENDING BUYs,
+    floored at 0. In a cash account a stock SELL settles at the next trading
+    day's 09:30 ET (T+1, weekends and US_HOLIDAYS_2026 skipped); crypto
+    settles at once; a margin account never waits. Settlement is stored on
+    the SELL row (`trades.available_at`), never recomputed.
+  * Every sum, count and report filters `created_at >= account.opened_at`, so
+    trades from before the account opened stay in the DB but never count.
+  * Costs are applied only here: log_trade calls costs.fill and stores
+    ref_price (the caller's quote), price (the fill), fees and amount;
+    execute_trade re-runs it only when it must cap a SELL at the held qty.
+  * A SELL can never credit more than the position it closes: an oversized
+    SELL is capped to the held shares and one against a flat position is
+    REJECTED. A BUY can never spend more than buying power: execute_trade
+    re-checks it inside the transaction (a PENDING hold is only a
+    reservation; the ledger at fill time is the authority) and REJECTS an
+    over-committed BUY. So cash + positions never lie about each other.
+  * Every mutating method takes one threading.Lock and runs inside a single
+    BEGIN IMMEDIATE transaction, so the buying-power check and the cash debit
+    are atomic across the fast-cycle worker thread and the event-loop thread.
+  * A quote of None or NaN is "no quote": every consumer of `prices` goes
+    through _quoted, so a pandas data gap can never make equity nan or
+    size an order against a nan equity.
+  * `self.conn` is OWNED by this class. In autocommit mode a transaction
+    belongs to the connection, not to a thread, so a `with budget.conn:` or
+    `commit()` issued from another thread would commit whatever _txn() has
+    half-written. Other modules may read through it from any thread, and may
+    write through it only on the thread that runs FastTrader.cycle (which is
+    sequential with _txn). Anything else opens its own connection with
+    `connect(budget.db_path)`.
 """
 
 import os
 import logging
+import sqlite3
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from src.database import connect
+from src import costs
+from src.database import DB_PATH, connect
+from src.intraday_engine import ET, is_crypto, next_trading_day_open
 
 logger = logging.getLogger(__name__)
 
+# The only day_state columns set_day_flag may stamp (the column name is
+# interpolated into SQL, so it must be whitelisted).
+DAY_FLAGS = ('loss_tripped_at', 'loss_announced_at', 'report_posted_at')
+
 
 def _week_key(dt: datetime = None) -> str:
-    """ISO year-week, e.g. '2026-W36'. Budget rolls over on Monday."""
+    """ISO year-week, e.g. '2026-W36'. Legacy NOT NULL column: still stamped, never read."""
     dt = dt or datetime.now()
     iso = dt.isocalendar()
     return f"{iso[0]}-W{iso[1]:02d}"
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+def _now(now: datetime | None = None) -> str:
+    """UTC ISO seconds. A tz-aware `now` overrides the wall clock so tests are deterministic.
+
+    Every timestamp column uses this one format, which is what makes
+    `available_at > ?` a correct lexical comparison in SQL.
+    """
+    now = now or datetime.now(timezone.utc)
+    return now.astimezone(timezone.utc).isoformat(timespec='seconds')
+
+
+def _et_date(ts_iso: str) -> str:
+    """ET calendar date of a UTC ISO string - the trading day a timestamp belongs to."""
+    return datetime.fromisoformat(ts_iso).astimezone(ET).strftime('%Y-%m-%d')
+
+
+def _quoted(price) -> float | None:
+    """A usable quote as float, or None when there is none.
+
+    NaN counts as missing: it is what a data gap looks like after pandas, it
+    is not None, and it poisons every sum it touches (and min(bp, nan) keeps
+    bp, which would size the entire buying power into one slot).
+    """
+    if price is None or price != price:
+        return None
+    return float(price)
 
 
 class BudgetTracker:
     def __init__(self, db_path: str = None):
-        self.conn = connect(db_path)
-        self.weekly_budget = float(os.getenv('WEEKLY_BUDGET', 5000))
-        logger.info(f"BudgetTracker ready (weekly budget ${self.weekly_budget:,.2f})")
+        # Kept so other threads can open their OWN connection to the same file
+        # (see the module docstring: they must never commit on self.conn).
+        self.db_path = db_path or DB_PATH
+        self.conn = connect(self.db_path)
+        # Autocommit mode: transactions are opened explicitly with BEGIN
+        # IMMEDIATE in _txn() so the write lock is taken up front rather than
+        # on the first UPDATE, where a deferred transaction can hit SQLITE_BUSY
+        # halfway through a trade.
+        self.conn.isolation_level = None
+        self._lock = threading.Lock()
+        logger.info(f"BudgetTracker ready ({self.account_type()} account opened {self.opened_at()}, "
+                    f"cash ${self.get_cash():,.2f} of ${self.starting_cash():,.2f} starting)")
 
     # --- internals -------------------------------------------------------
 
-    def _sum(self, statuses) -> float:
-        placeholders = ','.join('?' for _ in statuses)
-        row = self.conn.execute(
-            f"SELECT COALESCE(SUM(amount), 0) AS total FROM trades "
-            f"WHERE week_key = ? AND side = 'BUY' AND status IN ({placeholders})",
-            (_week_key(), *statuses),
-        ).fetchone()
-        return float(row['total'])
+    @contextmanager
+    def _txn(self):
+        """One locked BEGIN IMMEDIATE transaction: commit on success, rollback on error.
 
-    def _deployed(self) -> float:
-        """Cost basis of open positions, plus anything awaiting approval."""
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(shares * avg_price), 0) AS v FROM positions "
-            "WHERE shares > 0").fetchone()
-        pending = self.conn.execute(
-            "SELECT COALESCE(SUM(amount), 0) AS v FROM trades "
-            "WHERE status = 'PENDING' AND side = 'BUY'").fetchone()
-        return float(row['v']) + float(pending['v'])
-
-    def _committed(self) -> float:
-        if os.getenv('BUDGET_MODE', 'deployed') == 'cumulative':
-            return self._sum(('EXECUTED', 'PENDING'))
-        return self._deployed()
-
-    # --- budget ----------------------------------------------------------
-
-    def get_weekly_spent(self) -> float:
-        """What the embeds label "Spent".
-
-        In deployed mode that is capital currently at risk; in cumulative mode
-        it is total executed buy volume for the week.
+        The lock serialises this class's own writers. It cannot protect
+        against another module committing self.conn from a different thread
+        while this block is open - that is why such modules open their own
+        connection (connect(self.db_path)) instead.
         """
-        if os.getenv('BUDGET_MODE', 'deployed') == 'cumulative':
-            return self._sum(('EXECUTED',))
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
+
+    def _account(self) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM account WHERE id = 1").fetchone()
+        if row is None:
+            raise RuntimeError("account row missing - Database() must run before BudgetTracker")
+        return row
+
+    def _sum_since_open(self, column: str) -> float:
+        """SUM(column) over EXECUTED trades since the account opened. `column` is a literal."""
         row = self.conn.execute(
-            "SELECT COALESCE(SUM(shares * avg_price), 0) AS v FROM positions "
-            "WHERE shares > 0").fetchone()
+            f"SELECT COALESCE(SUM({column}), 0) AS v FROM trades "
+            "WHERE status = 'EXECUTED' AND created_at >= ?", (self.opened_at(),)
+        ).fetchone()
         return float(row['v'])
 
-    def get_turnover(self) -> float:
-        """Total executed BUY volume this week, regardless of budget mode."""
-        return self._sum(('EXECUTED',))
+    def _positions_value(self, prices: dict) -> float:
+        """Market value of open positions; a symbol without a quote (None/NaN) is carried at avg_price."""
+        total = 0.0
+        for pos in self.get_positions():
+            price = _quoted(prices.get(pos['symbol']))
+            total += pos['shares'] * (pos['avg_price'] if price is None else price)
+        return total
 
-    def get_remaining_budget(self) -> float:
-        """Budget left after executed AND pending-approval trades."""
-        return max(0.0, self.weekly_budget - self._committed())
+    def _pending_buy_holds(self, exclude_id: int | None = None) -> float:
+        """Sum of `amount` over PENDING BUYs - buying power they reserve before they fill."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS v FROM trades "
+            "WHERE side = 'BUY' AND status = 'PENDING' AND id IS NOT ?", (exclude_id,)
+        ).fetchone()
+        return float(row['v'])
 
-    def can_trade(self, amount: float) -> bool:
-        if amount <= 0:
-            return False
-        return (self._committed() + amount) <= self.weekly_budget
+    # --- account ---------------------------------------------------------
+
+    def opened_at(self) -> str:
+        return self._account()['opened_at']
+
+    def starting_cash(self) -> float:
+        return float(self._account()['starting_cash'])
+
+    def account_type(self) -> str:
+        return self._account()['account_type']
+
+    def get_cash(self) -> float:
+        return float(self._account()['cash'])
+
+    def get_unsettled(self, now: datetime | None = None) -> float:
+        """SELL proceeds that cannot be spent yet (cash-account T+1 rule)."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS v FROM trades "
+            "WHERE side = 'SELL' AND status = 'EXECUTED' AND available_at > ? AND created_at >= ?",
+            (_now(now), self.opened_at()),
+        ).fetchone()
+        return float(row['v'])
+
+    def get_buying_power(self, now: datetime | None = None) -> float:
+        """Cash minus unsettled proceeds minus PENDING BUY holds; never negative."""
+        return max(0.0, self.get_cash() - self.get_unsettled(now) - self._pending_buy_holds())
+
+    def get_equity(self, prices: dict) -> float:
+        """Cash + market value of open positions (missing quotes valued at avg_price)."""
+        return self.get_cash() + self._positions_value(prices)
+
+    def get_fees_paid(self) -> float:
+        return self._sum_since_open('fees')
+
+    def get_realized_pnl(self) -> float:
+        """Booked P&L, net of fees, from closed paper positions since the account opened."""
+        return self._sum_since_open('realized_pnl')
+
+    def get_gross_pnl(self) -> float:
+        """Booked P&L before fees (= realized + fees)."""
+        return self._sum_since_open('gross_pnl')
+
+    # --- sizing ----------------------------------------------------------
+
+    def size_order(self, symbol: str, ref_price: float, prices: dict | None = None,
+                   now: datetime | None = None) -> tuple[float, float, float]:
+        """(qty, size_usd, est_fill) for a BUY; qty is 0.0 when the order is too small.
+
+        Every entry is the same fraction of equity (equity / FAST_MAX_POSITIONS)
+        capped by buying power, so wins compound and losses shrink the next
+        order. Orders are dollar-based (qty = size_usd / estimated fill), so the
+        cash debit can never exceed buying power (6-dp qty rounding aside).
+        `prices` is the dict of quotes the same cycle already fetched for held
+        symbols - no second quote is taken for sizing.
+        """
+        buying_power = self.get_buying_power(now)
+        equity = self.get_equity(prices or {})
+        slots = int(os.getenv('FAST_MAX_POSITIONS', 4))
+        size_usd = min(buying_power, equity / slots)
+        est_fill = costs.fill(symbol, 'BUY', float(ref_price), 1)['fill_price']
+        if size_usd < float(os.getenv('MIN_ORDER_USD', 1)):
+            return 0.0, size_usd, est_fill
+        return round(size_usd / est_fill, 6), size_usd, est_fill
 
     # --- trade lifecycle -------------------------------------------------
 
-    def log_trade(self, symbol: str, side: str, price: float, shares: int) -> int:
-        """Record a PENDING trade awaiting Discord approval. Returns its id."""
-        amount = float(price) * int(shares)
-        with self.conn:
+    def log_trade(self, symbol: str, side: str, ref_price: float, qty: float, *,
+                  probability: float | None = None, exit_reason: str | None = None,
+                  now: datetime | None = None) -> int:
+        """Record a PENDING trade at its simulated fill. Returns its id.
+
+        This is the only place costs are applied: the row stores the caller's
+        quote (ref_price), the fill (price), fees and the net cash movement
+        (amount). Callers never compute costs themselves.
+
+        Raises ValueError for a non-positive qty or ref_price: a negative
+        BUY would carry a negative amount and CREDIT cash on execute, a zero
+        qty would write a 0-share position row, and a zero price divides
+        sizing by zero. Like costs.fill on a bad side, fail loudly.
+        """
+        qty = round(float(qty), 6)
+        ref_price = float(ref_price)
+        if not qty > 0:
+            raise ValueError(f"log_trade: qty must be positive, got {qty!r}")
+        if not ref_price > 0:
+            raise ValueError(f"log_trade: ref_price must be positive, got {ref_price!r}")
+        f = costs.fill(symbol, side, ref_price, qty)
+        created_at = _now(now)
+        with self._txn():
             cur = self.conn.execute(
-                "INSERT INTO trades (symbol, side, price, shares, amount, status, created_at, week_key) "
-                "VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)",
-                (symbol, side, float(price), int(shares), amount, _now(), _week_key()),
+                "INSERT INTO trades (symbol, side, ref_price, price, shares, fees, amount, status, "
+                "created_at, week_key, trade_date, entry_probability, exit_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?)",
+                (symbol, side, ref_price, f['fill_price'], qty, f['fees'], f['net'],
+                 created_at, _week_key(now), _et_date(created_at), probability, exit_reason),
             )
-        trade_id = cur.lastrowid
-        logger.info(f"Logged PENDING trade #{trade_id}: {side} {shares} {symbol} @ ${price:.2f}")
+            trade_id = cur.lastrowid
+        logger.info(f"Logged PENDING trade #{trade_id}: {side} {costs.qty_str(qty)} {symbol} "
+                    f"@ ${f['fill_price']:,.4f} (ref ${ref_price:,.4f}, fees ${f['fees']:.4f})")
         return trade_id
 
-    def execute_trade(self, trade_id: int):
-        """Mark an approved trade executed and update the position."""
-        row = self.conn.execute(
-            "SELECT * FROM trades WHERE id = ? AND status = 'PENDING'", (trade_id,)
-        ).fetchone()
-        if row is None:
-            logger.warning(f"execute_trade: trade #{trade_id} not found or not pending")
-            return False
+    def execute_trade(self, trade_id: int, now: datetime | None = None) -> sqlite3.Row | None:
+        """PENDING -> EXECUTED: move cash, book settlement and P&L, apply the position.
 
-        with self.conn:
+        Returns the executed row so callers report the ledger's fill, amount,
+        fees and P&L instead of recomputing them; None when the trade is not
+        PENDING (already decided, or unknown id), when a BUY no longer fits
+        buying power, or when a SELL finds nothing to sell (both are marked
+        REJECTED).
+
+        A BUY can only ever spend what the ledger has. size_order reads
+        buying power outside the lock, so the fast cycle and a Discord /buy
+        can both be told the same figure before either logs its trade; the
+        re-check here, inside the transaction, is what makes the check and
+        the debit atomic. Only the slack of 6-dp qty rounding on the very
+        order size_order produced is forgiven.
+
+        A SELL can only ever close what the ledger holds. Between log_trade
+        and execute_trade the position may have shrunk or vanished - a manual
+        /sell awaiting approval while the fast cycle auto-exits the same
+        symbol, or two exit rows left PENDING across a restart. Crediting the
+        full proceeds then would mint cash out of nothing, so the fill is
+        capped at the held quantity (costs recomputed, row updated) before
+        cash moves, and a SELL against a flat position is REJECTED.
+        """
+        ts = _now(now)
+        with self._txn():
+            row = self.conn.execute(
+                "SELECT * FROM trades WHERE id = ? AND status = 'PENDING'", (trade_id,)
+            ).fetchone()
+            if row is None:
+                logger.warning(f"execute_trade: trade #{trade_id} not found or not pending")
+                return None
+            available_at = None
+            if row['side'] == 'BUY':
+                if not self._buy_fits(row, now):
+                    self.conn.execute(
+                        "UPDATE trades SET status = 'REJECTED', settled_at = ? WHERE id = ?",
+                        (ts, trade_id),
+                    )
+                    return None
+                self.conn.execute("UPDATE account SET cash = cash - ? WHERE id = 1", (row['amount'],))
+            else:
+                row = self._cap_sell_to_held(row)
+                if row is None:
+                    self.conn.execute(
+                        "UPDATE trades SET status = 'REJECTED', settled_at = ? WHERE id = ?",
+                        (ts, trade_id),
+                    )
+                    return None
+                self.conn.execute("UPDATE account SET cash = cash + ? WHERE id = 1", (row['amount'],))
+                available_at = self._available_at(row)
+            self._apply_position(row, ts)
             self.conn.execute(
-                "UPDATE trades SET status = 'EXECUTED', settled_at = ? WHERE id = ?",
-                (_now(), trade_id),
+                "UPDATE trades SET status = 'EXECUTED', settled_at = ?, available_at = ? WHERE id = ?",
+                (ts, available_at, trade_id),
             )
-            self._apply_position(row)
-        logger.info(f"Trade #{trade_id} EXECUTED")
-        return True
+            row = self.conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        logger.info(f"Trade #{trade_id} EXECUTED: {row['side']} {costs.qty_str(float(row['shares']))} "
+                    f"{row['symbol']} @ ${row['price']:,.4f}, cash ${self.get_cash():,.2f}")
+        return row
 
-    def reject_trade(self, trade_id: int):
-        """Mark a trade rejected (declined or timed out); frees its budget hold."""
-        with self.conn:
+    def _available_at(self, row: sqlite3.Row) -> str:
+        """When a SELL's proceeds become spendable. Stored on the row, never recomputed."""
+        if is_crypto(row['symbol']) or self.account_type() == 'margin':
+            return row['created_at']
+        opens = next_trading_day_open(datetime.fromisoformat(row['created_at']))
+        return opens.astimezone(timezone.utc).isoformat(timespec='seconds')
+
+    def _buy_fits(self, row: sqlite3.Row, now: datetime | None) -> bool:
+        """Does this PENDING BUY still fit buying power? Caller holds the transaction.
+
+        Available = cash - unsettled - the OTHER pending BUY holds (this row's
+        own hold is a reservation for exactly this fill, so it is not counted
+        against itself). It is deliberately not floored at 0 like
+        get_buying_power: an over-committed account must reject, not be read
+        as "0 available + my hold".
+
+        Tolerance: size_order rounds qty to 6 dp and BUY fees are zero, so an
+        order sized at exactly buying power can overshoot it by at most half
+        a 6-dp step at the fill price (a few cents on a $100k coin). That is
+        sizing's documented slack, not the caller's; anything beyond it is.
+        """
+        available = (self.get_cash() - self.get_unsettled(now)
+                     - self._pending_buy_holds(exclude_id=row['id']))
+        tolerance = 0.5e-6 * float(row['price']) + 1e-6
+        if row['amount'] <= available + tolerance:
+            return True
+        logger.warning(f"execute_trade: BUY #{row['id']} of {costs.qty_str(float(row['shares']))} "
+                       f"{row['symbol']} needs ${row['amount']:,.2f} but only ${max(0.0, available):,.2f} "
+                       f"is available - rejecting")
+        return False
+
+    def _cap_sell_to_held(self, row: sqlite3.Row) -> sqlite3.Row | None:
+        """Shrink a PENDING SELL to the shares actually held. Caller holds the transaction.
+
+        Returns the (possibly rewritten) row, or None when nothing is held -
+        the caller rejects the trade. A capped row gets its shares, fees and
+        amount recomputed through costs.fill at the original ref_price, so
+        the ledger still applies costs in one place and cash is credited only
+        for shares that existed.
+        """
+        pos = self.conn.execute(
+            "SELECT shares FROM positions WHERE symbol = ?", (row['symbol'],)).fetchone()
+        held = float(pos['shares']) if pos else 0.0
+        qty = float(row['shares'])
+        if held < 1e-6:
+            logger.warning(f"execute_trade: SELL #{row['id']} of {costs.qty_str(qty)} {row['symbol']} "
+                           f"but nothing is held - rejecting")
+            return None
+        if qty <= held + 1e-6:
+            return row
+        logger.warning(f"execute_trade: SELL #{row['id']} of {costs.qty_str(qty)} {row['symbol']} "
+                       f"exceeds the {costs.qty_str(held)} held - capping the fill")
+        f = costs.fill(row['symbol'], 'SELL', float(row['ref_price']), held)
+        self.conn.execute(
+            "UPDATE trades SET shares = ?, fees = ?, amount = ? WHERE id = ?",
+            (held, f['fees'], f['net'], row['id']),
+        )
+        return self.conn.execute("SELECT * FROM trades WHERE id = ?", (row['id'],)).fetchone()
+
+    def reject_trade(self, trade_id: int, now: datetime | None = None) -> bool:
+        """PENDING -> REJECTED (declined or timed out); releases its buying-power hold."""
+        with self._txn():
             cur = self.conn.execute(
                 "UPDATE trades SET status = 'REJECTED', settled_at = ? "
                 "WHERE id = ? AND status = 'PENDING'",
-                (_now(), trade_id),
+                (_now(now), trade_id),
             )
-        if cur.rowcount:
+            n = cur.rowcount
+        if n:
             logger.info(f"Trade #{trade_id} REJECTED")
-        return bool(cur.rowcount)
+        return bool(n)
 
-    def _apply_position(self, row):
+    def _apply_position(self, row: sqlite3.Row, ts: str) -> None:
         """Weighted-average position update. Caller holds the transaction.
 
-        On a SELL this also books realized P&L against the position's average
-        cost, which is what makes the paper-trading record scoreable.
+        avg_price is the net cost basis (built from `amount`, so fees are in
+        it). entry_ref is the quantity-weighted ref_price of the open lots:
+        the fast trader measures barriers against it (reference-to-reference,
+        the same move the labels use), so costs show up in cash and P&L but
+        never in the trigger. A SELL books realized_pnl (net) and gross_pnl.
         """
         pos = self.conn.execute(
-            "SELECT shares, avg_price FROM positions WHERE symbol = ?", (row['symbol'],)
+            "SELECT shares, avg_price, entry_ref FROM positions WHERE symbol = ?", (row['symbol'],)
         ).fetchone()
-        held = pos['shares'] if pos else 0
-        avg = pos['avg_price'] if pos else 0.0
+        held = float(pos['shares']) if pos else 0.0
+        avg = float(pos['avg_price']) if pos else 0.0
+        entry_ref = float(pos['entry_ref']) if pos else 0.0
+        qty = float(row['shares'])
 
         if row['side'] == 'BUY':
-            new_shares = held + row['shares']
+            new_shares = held + qty
             new_avg = ((held * avg) + row['amount']) / new_shares if new_shares else 0.0
+            new_ref = ((held * entry_ref) + qty * row['ref_price']) / new_shares if new_shares else 0.0
         else:
-            closed = min(row['shares'], held)
-            realized = (row['price'] - avg) * closed if held else 0.0
+            closed = min(qty, held)
+            realized = row['amount'] - closed * avg              # net of fees
             self.conn.execute(
-                "UPDATE trades SET realized_pnl = ? WHERE id = ?", (realized, row['id'])
+                "UPDATE trades SET realized_pnl = ?, gross_pnl = ? WHERE id = ?",
+                (realized, realized + row['fees'], row['id']),
             )
-            new_shares = held - row['shares']
-            new_avg = avg if new_shares > 0 else 0.0
-            if new_shares < 0:
+            new_shares = held - qty
+            new_avg, new_ref = avg, entry_ref                    # a partial SELL leaves both alone
+            if new_shares < -1e-6:
+                # execute_trade caps a SELL at the held quantity before cash
+                # moves, so this only fires if a caller bypasses it; the
+                # position can still never go negative.
                 logger.warning(f"SELL exceeds held shares for {row['symbol']} - clamping to 0")
-                new_shares, new_avg = 0, 0.0
+                new_shares = 0.0
+
+        # Fractional round trips leave binary-float dust (0.1 + 0.2 - 0.3); a
+        # dust position would otherwise count as "held" and block re-entry.
+        if abs(new_shares) < 1e-6:
+            new_shares, new_avg, new_ref = 0.0, 0.0, 0.0
 
         self.conn.execute(
-            "INSERT INTO positions (symbol, shares, avg_price, updated_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(symbol) DO UPDATE SET shares=excluded.shares, "
-            "avg_price=excluded.avg_price, updated_at=excluded.updated_at",
-            (row['symbol'], new_shares, new_avg, _now()),
+            "INSERT INTO positions (symbol, shares, avg_price, entry_ref, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(symbol) DO UPDATE SET shares=excluded.shares, avg_price=excluded.avg_price, "
+            "entry_ref=excluded.entry_ref, updated_at=excluded.updated_at",
+            (row['symbol'], new_shares, new_avg, new_ref, ts),
         )
 
-    # --- reporting -------------------------------------------------------
+    # --- positions / reporting -------------------------------------------
 
-    def get_positions(self) -> list:
+    def get_positions(self) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT symbol, shares, avg_price, updated_at FROM positions WHERE shares > 0 "
-            "ORDER BY symbol"
+            "SELECT symbol, shares, avg_price, entry_ref, updated_at FROM positions "
+            "WHERE shares > 1e-9 ORDER BY symbol"
         ).fetchall()
         return [
             {
                 'symbol': r['symbol'],
-                'shares': r['shares'],
+                'shares': float(r['shares']),
                 # NOT rounded: FastTrader computes stop-loss and take-profit
-                # against this value, so rounding to cents moved the executed
-                # barriers away from the trained ones. On sub-$1 crypto the
-                # error reached 5% of entry - a "take profit" could fire at a
-                # real loss. Round for display only, never for arithmetic.
+                # against entry_ref and P&L against avg_price, so rounding to
+                # cents moved the executed barriers away from the trained
+                # ones. On sub-$1 crypto the error reached 5% of entry - a
+                # "take profit" could fire at a real loss. Round for display
+                # only, never for arithmetic.
                 'avg_price': float(r['avg_price']),
-                'cost_basis': float(r['shares'] * r['avg_price']),
+                'entry_ref': float(r['entry_ref']),
+                'cost_basis': float(r['shares']) * float(r['avg_price']),
                 'updated_at': r['updated_at'],
             }
             for r in rows
         ]
 
-    def get_realized_pnl(self) -> float:
-        """Total booked profit/loss from closed (sold) paper positions."""
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM trades "
-            "WHERE status = 'EXECUTED' AND realized_pnl IS NOT NULL"
-        ).fetchone()
-        return float(row['total'])
-
     def get_pnl(self, price_fn) -> dict:
-        """Mark open positions to market.
+        """Mark open positions to market and roll up the whole account.
 
-        `price_fn(symbol)` returns a current price, or None when unavailable -
-        those positions are reported as stale rather than silently valued at
-        cost, so a data outage can never masquerade as break-even.
+        `price_fn(symbol)` returns a current price, or None (or NaN) when
+        unavailable. Those positions are listed as stale with pnl None (a
+        data outage never masquerades as break-even); for equity they are
+        carried at avg_price because the account needs one number.
         """
-        positions, unrealized, cost_total, market_total, stale = [], 0.0, 0.0, 0.0, []
+        positions, unrealized, cost_total, market_total, stale, prices = [], 0.0, 0.0, 0.0, [], {}
 
         for pos in self.get_positions():
             price = None
             try:
-                price = price_fn(pos['symbol'])
+                price = _quoted(price_fn(pos['symbol']))
             except Exception as e:
                 logger.warning(f"price lookup failed for {pos['symbol']}: {e}")
 
@@ -228,6 +489,7 @@ class BudgetTracker:
                 positions.append({**pos, 'price': None, 'pnl': None, 'pnl_pct': None})
                 continue
 
+            prices[pos['symbol']] = price
             market = price * pos['shares']
             pnl = market - pos['cost_basis']
             unrealized += pnl
@@ -242,6 +504,8 @@ class BudgetTracker:
             })
 
         realized = self.get_realized_pnl()
+        starting = self.starting_cash()
+        equity = self.get_equity(prices)
         return {
             'positions': positions,
             'stale': stale,
@@ -250,34 +514,83 @@ class BudgetTracker:
             'total': realized + unrealized,
             'cost_basis': cost_total,
             'market_value': market_total,
-            'return_pct': (unrealized / cost_total) if cost_total else 0.0,
+            'cash': self.get_cash(),
+            'unsettled': self.get_unsettled(),
+            'buying_power': self.get_buying_power(),
+            'equity': equity,
+            'starting_cash': starting,
+            'all_time_net': equity - starting,
+            # a fraction, like pnl_pct: format with :+.2%
+            'all_time_pct': ((equity - starting) / starting) if starting else 0.0,
+            'fees_paid': self.get_fees_paid(),
+            'gross_pnl': self.get_gross_pnl(),
         }
 
-    def set_weekly_budget(self, amount: float):
-        self.weekly_budget = float(amount)
-        logger.info(f"Weekly budget changed to ${self.weekly_budget:,.2f}")
-        return self.weekly_budget
+    def get_trades_since_open(self, day: str | None = None) -> list[sqlite3.Row]:
+        """EXECUTED trades since the account opened, optionally for one ET trade_date."""
+        sql = "SELECT * FROM trades WHERE status = 'EXECUTED' AND created_at >= ?"
+        params = [self.opened_at()]
+        if day:
+            sql += " AND trade_date = ?"
+            params.append(day)
+        return self.conn.execute(sql + " ORDER BY created_at, id", params).fetchall()
 
-    def get_statistics(self) -> dict:
-        agg = self.conn.execute(
-            "SELECT status, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total "
-            "FROM trades GROUP BY status"
-        ).fetchall()
-        counts = {r['status']: r['n'] for r in agg}
-        executed = counts.get('EXECUTED', 0)
-        rejected = counts.get('REJECTED', 0)
-        decided = executed + rejected
+    # --- day state / equity history --------------------------------------
 
-        return {
-            'Trades Executed': executed,
-            'Trades Rejected': rejected,
-            'Awaiting Approval': counts.get('PENDING', 0),
-            'Approval Rate': f"{(executed / decided):.0%}" if decided else "n/a",
-            'Open Positions': len(self.get_positions()),
-            'Week': _week_key(),
-            'Weekly Budget': f"${self.weekly_budget:,.2f}",
-            'Capital Deployed': f"${self.get_weekly_spent():,.2f}",
-            'Turnover This Week': f"${self.get_turnover():,.2f}",
-            'Remaining': f"${self.get_remaining_budget():,.2f}",
-            'Realized P&L': f"${self.get_realized_pnl():,.2f}",
-        }
+    def get_day_state(self, date_et: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM day_state WHERE date = ?", (date_et,)).fetchone()
+
+    def ensure_day_state(self, date_et: str, equity: float) -> sqlite3.Row:
+        """Create the day's row with its start-of-day equity; a same-date restart keeps the original."""
+        with self._txn():
+            self.conn.execute(
+                "INSERT OR IGNORE INTO day_state (date, start_equity) VALUES (?, ?)",
+                (date_et, float(equity)),
+            )
+        return self.get_day_state(date_et)
+
+    def set_day_flag(self, date_et: str, column: str, ts: str | None = None) -> None:
+        """Stamp one of the day's latches (loss tripped / announced, report posted)."""
+        if column not in DAY_FLAGS:
+            raise ValueError(f"set_day_flag: {column!r} is not one of {DAY_FLAGS}")
+        with self._txn():
+            cur = self.conn.execute(
+                f"UPDATE day_state SET {column} = ? WHERE date = ?", (ts or _now(), date_et)
+            )
+            n = cur.rowcount
+        if not n:
+            logger.warning(f"set_day_flag: no day_state row for {date_et} ({column} not set)")
+
+    def record_equity(self, date_et: str, prices: dict, now: datetime | None = None) -> dict:
+        """Upsert the day's equity snapshot (written by the 16:05 ET report tick, not by /pnl)."""
+        with self._txn():
+            # Read inside the transaction so the snapshot cannot straddle a
+            # trade executing on the other thread.
+            cash = self.get_cash()
+            positions_value = self._positions_value(prices)
+            self.conn.execute(
+                "INSERT INTO equity_history (date, cash, positions_value, equity, fees_to_date, "
+                "realized_to_date, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(date) DO UPDATE SET cash=excluded.cash, "
+                "positions_value=excluded.positions_value, equity=excluded.equity, "
+                "fees_to_date=excluded.fees_to_date, realized_to_date=excluded.realized_to_date, "
+                "recorded_at=excluded.recorded_at",
+                (date_et, cash, positions_value, cash + positions_value,
+                 self.get_fees_paid(), self.get_realized_pnl(), _now(now)),
+            )
+            row = self.conn.execute(
+                "SELECT * FROM equity_history WHERE date = ?", (date_et,)).fetchone()
+        return dict(row)
+
+    def equity_series(self) -> list[dict]:
+        """Daily equity, oldest first, with day 0 = starting cash on the open date.
+
+        Day 0 is synthetic (only `date` and `equity`); the rest are full
+        equity_history rows. Drawdown and the chart need the starting point
+        so a losing first day is not a 0% drawdown. Its date is the ET
+        calendar day of opened_at, like every other date in the series - an
+        evening open (after 20:00 ET) is already the next day in UTC.
+        """
+        rows = self.conn.execute("SELECT * FROM equity_history ORDER BY date").fetchall()
+        return ([{'date': _et_date(self.opened_at()), 'equity': self.starting_cash()}]
+                + [dict(r) for r in rows])

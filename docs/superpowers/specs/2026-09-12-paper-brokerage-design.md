@@ -268,7 +268,9 @@ unconditionally (not only when intraday training succeeds). Each tick, with
 
 `build_scorecard(budget, engine, intraday, day) -> dict` lives in new
 `src/scorecard.py` with `wilson_ci(hits, n)` and `mean_ci(values)` (mean,
-SE, 95% normal interval with z=1.96 — scipy is not a dependency). `discord_bot._scorecard_embed(day)` renders it and is
+SE, 95% normal interval with z = 1.96 — scipy is not a declared dependency, and
+at the n ≥ 60 the GO rule requires t(0.975, 59) = 2.00 differs by 2%).
+`discord_bot._scorecard_embed(day)` renders it and is
 used by the 16:05 report, `/pnl` and `/summary`. `/stats` is removed
 (`get_statistics` deleted). The "Registered N slash commands" log count is
 updated. "Today" everywhere means the ET date (`trades.trade_date`).
@@ -340,8 +342,9 @@ argument; tests never rely on wall-clock time.
 - sizing: fractional qty; `size_usd < MIN_ORDER_USD` → no order; from a
   fresh $500 account filling all `FAST_MAX_POSITIONS` slots, every net debit
   ≤ buying power with slippage applied and cash ≥ 0 (stock and crypto);
-  third entry when buying power binds fills in full; compounding after a
-  win.
+  an entry when buying power binds (unsettled proceeds leave it below
+  equity / FAST_MAX_POSITIONS) fills in full at buying power; compounding
+  after a win.
 - barriers ref-to-ref: crypto BUY at ref 100 (fill 100.60) → cycle at ref
   100 no exit; at 99.61 no exit; at 99.60 stop fires, fills 99.60 × 0.994,
   `realized_pnl` per unit = fill − 100.60 (≈ −1.19% of cost). Stock BUY at

@@ -8,6 +8,15 @@ under a heading "Contract additions" — never rename anything below.
 Repo: `/home/gdhughey/hugheylab-trading-bot`. Tests: `dev/ct-test.sh [pytest args]`
 (pushes the tree to LXC 200 and runs pytest in the production venv; the pve
 host has no sklearn/pandas/discord). Tests use a file DB under `tmp_path`.
+Clock rule: any test that constructs `Database()` and then reads anything
+filtered by `account.opened_at` (`get_unsettled`, `get_buying_power`,
+`get_fees_paid`, `get_realized_pnl`, `get_gross_pnl`, `get_trades_since_open`,
+`build_scorecard`) MUST either pass `Database(path, now=<fixed UTC datetime
+earlier than every trade stamp>)` or pin `opened_at` with
+`UPDATE account SET opened_at = ?`. An unpinned `opened_at` is the wall clock
+and silently excludes fixed-date trades once the real date passes them.
+`tests/test_fast_trader.py::make_budget` uses `Database(path, now=OPENED_AT)`
+with `OPENED_AT = 2026-09-01T00:00Z`.
 
 ## Task order and dependencies
 
@@ -19,7 +28,7 @@ host has no sklearn/pandas/discord). Tests use a file DB under `tmp_path`.
 | 4 | account ledger | `src/budget_tracker.py`, `tests/test_budget_tracker.py` | 1, 2, 3 |
 | 5 | signal log | `src/signal_log.py`, `src/intraday_engine.py` (`signal()` bar_ts), `tests/test_signal_log.py` | 3 |
 | 6 | fast trader | `src/fast_trader.py`, `tests/test_fast_trader.py` | 1, 2, 4, 5 |
-| 7 | scorecard | `src/scorecard.py`, `tests/test_scorecard.py` | 4 |
+| 7 | scorecard | `src/scorecard.py`, `tests/test_scorecard.py` | 4, 5, 6 (8 for the live report) |
 | 8 | benchmark | `src/ml_engine.py`, `tests/test_benchmark.py` | — |
 | 9 | discord | `src/discord_bot.py`, `tests/test_discord_embeds.py` | 4, 6, 7 |
 | 10 | config + deploy | `.env.example`, `configure.sh`, `README.md`, live `.env`, restart | all |
@@ -133,12 +142,18 @@ def size_order(self, symbol, ref_price, prices=None, now=None) -> tuple[float, f
 # trade lifecycle (all under self._lock, BEGIN IMMEDIATE)
 def log_trade(self, symbol, side, ref_price, qty, *, probability=None, exit_reason=None, now=None) -> int
     # rounds qty to 6dp, calls costs.fill, inserts PENDING row with ref_price, price=fill, fees,
-    # amount=net, shares=qty, trade_date=_et_date(created_at), entry_probability, exit_reason, week_key
+    # amount=net, shares=qty, trade_date=_et_date(created_at), entry_probability, exit_reason, week_key.
+    # Raises ValueError when qty (after rounding) or ref_price is not > 0; nothing is written.
 def execute_trade(self, trade_id, now=None) -> sqlite3.Row | None
     # PENDING -> EXECUTED; BUY: cash -= amount; SELL: cash += amount, available_at
     # (stock: next_trading_day_open(created_at) as UTC ISO; crypto: created_at),
     # realized_pnl = amount - closed*avg_price, gross_pnl = realized_pnl + fees;
     # applies position (entry_ref weighting, |shares|<1e-6 -> 0). Returns the executed row.
+    # Returns None (nothing moved) when the row is not PENDING, and marks the row REJECTED and
+    # returns None when, inside the transaction: a BUY's amount exceeds cash - unsettled - the
+    # OTHER pending BUY holds (6-dp qty-rounding slack forgiven), or a SELL finds nothing held.
+    # A SELL for more than is held is capped to the held qty (shares/fees/amount recomputed).
+    # Callers MUST treat None as "did not fill" for both sides.
 def reject_trade(self, trade_id, now=None) -> bool
 
 # positions / reporting
@@ -147,6 +162,8 @@ def get_pnl(self, price_fn) -> dict
     # keys: positions, stale, realized, unrealized, total, cost_basis, market_value,
     #       cash, unsettled, buying_power, equity, starting_cash, all_time_net, all_time_pct,
     #       fees_paid, gross_pnl   (return_pct REMOVED)
+    # price_fn(symbol) -> price | None; None AND NaN mean "no quote" (stale, carried at avg_price).
+    # The same None/NaN rule applies to every `prices` dict (get_equity, size_order, record_equity).
 def get_trades_since_open(self, day: str | None = None) -> list[sqlite3.Row]  # EXECUTED, created_at >= opened_at, optional trade_date filter
 
 # day state / equity history
@@ -154,7 +171,7 @@ def get_day_state(self, date_et: str) -> sqlite3.Row | None
 def ensure_day_state(self, date_et: str, equity: float) -> sqlite3.Row   # INSERT OR IGNORE then return
 def set_day_flag(self, date_et: str, column: str, ts: str | None = None) -> None  # column in ('loss_tripped_at','loss_announced_at','report_posted_at')
 def record_equity(self, date_et: str, prices: dict, now=None) -> dict    # upserts equity_history; returns the row as dict
-def equity_series(self) -> list[dict]          # equity_history rows ordered by date, prefixed by {'date': opened_at[:10], 'equity': starting_cash}
+def equity_series(self) -> list[dict]          # equity_history rows ordered by date, prefixed by {'date': _et_date(opened_at), 'equity': starting_cash} (ET date, NOT opened_at[:10]: an evening open is already the next day in UTC)
 ```
 Deleted: `weekly_budget`, `set_weekly_budget`, `get_weekly_spent`, `get_turnover`,
 `get_remaining_budget`, `can_trade`, `get_statistics`, `_sum`, `_deployed`, `_committed`.

@@ -2473,10 +2473,12 @@ In `/home/gdhughey/hugheylab-trading-bot/src/budget_tracker.py`, append the foll
 
         Day 0 is synthetic (only `date` and `equity`); the rest are full
         equity_history rows. Drawdown and the chart need the starting point
-        so a losing first day is not a 0% drawdown.
+        so a losing first day is not a 0% drawdown. Its date is the ET
+        calendar day of opened_at, like every other date in the series - an
+        evening open (after 20:00 ET) is already the next day in UTC.
         """
         rows = self.conn.execute("SELECT * FROM equity_history ORDER BY date").fetchall()
-        return ([{'date': self.opened_at()[:10], 'equity': self.starting_cash()}]
+        return ([{'date': _et_date(self.opened_at()), 'equity': self.starting_cash()}]
                 + [dict(r) for r in rows])
 ```
 
@@ -6008,7 +6010,7 @@ from datetime import datetime, timezone, time as dtime
 import logging
 from src import costs, signal_log
 from src.claude_analyzer import ClaudeAnalyzer
-from src.budget_tracker import BudgetTracker
+from src.budget_tracker import BudgetTracker, _et_date
 from src.costs import qty_str
 from src.database import connect
 from src.ml_engine import load_universe
@@ -6213,7 +6215,7 @@ Insert `_scorecard_embed` directly BELOW the `daily_summary` loop (after line 57
         sc = build_scorecard(self.budget_tracker, self.engine, self.intraday,
                              day_et, now=now)
         h, acct, today = sc['headline'], sc['account'], sc['today']
-        opened = self.budget_tracker.opened_at()[:10]
+        opened = _et_date(self.budget_tracker.opened_at())   # ET date; an evening open is already tomorrow in UTC
         net = h['all_time_net']
         colour = (discord.Color.green() if net > 0 else
                   discord.Color.red() if net < 0 else discord.Color.greyple())
