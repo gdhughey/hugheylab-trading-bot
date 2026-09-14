@@ -9,17 +9,48 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import os
 import asyncio
-from datetime import datetime, timedelta, time as dtime
+import math
+from datetime import datetime, timezone, time as dtime
 import logging
+from src import costs, signal_log
 from src.claude_analyzer import ClaudeAnalyzer
-from src.budget_tracker import BudgetTracker
+from src.budget_tracker import BudgetTracker, _et_date
+from src.costs import qty_str
+from src.database import connect
 from src.ml_engine import load_universe
 from src.intraday_engine import (IntradayEngine, market_state,
                                  minutes_to_close, ET, is_crypto,
-                                 asset_class, barriers)
-from src.fast_trader import FastTrader
+                                 asset_class, barriers, next_trading_day_open)
+from src.fast_trader import FastTrader, class_gate, max_hold_min
+from src.scorecard import build_scorecard, cost_breakeven
 
 logger = logging.getLogger(__name__)
+
+
+def _signed_usd(x: float) -> str:
+    """'+$1.23' / '-$1.23' - the sign goes before the dollar sign, which an
+    f-string format spec cannot do on its own."""
+    return f"{'-' if x < 0 else '+'}${abs(x):,.2f}"
+
+
+def _icon(cls: str) -> str:
+    return '🪙' if cls == 'crypto' else '📈'
+
+
+def _clip_lines(lines, limit: int = 1000) -> str:
+    """Join lines for one embed field, dropping trailing lines until the text
+    (including its '… and N more' tail) fits. Discord caps a field value at
+    1024 chars; 1000 leaves headroom for markdown the caller adds."""
+    lines = list(lines)
+    kept = len(lines)
+    while kept > 0:
+        text = "\n".join(lines[:kept])
+        if kept < len(lines):
+            text += f"\n… and {len(lines) - kept} more"
+        if len(text) <= limit:
+            return text
+        kept -= 1
+    return f"… and {len(lines)} more"
 
 class TradingBot(commands.Cog):
     def __init__(self, bot_instance=None, engine=None, db=None):
@@ -46,8 +77,7 @@ class TradingBot(commands.Cog):
                                 quote_fn=lambda s: self.engine.latest_price(s))
                      if self.fast_mode else None)
         self._last_fast_summary = None
-        self._last_daily_summary = None
-        
+
         # Add cogs
         self.bot.add_listener(self.on_ready)
         self._register_slash()
@@ -449,6 +479,101 @@ class TradingBot(commands.Cog):
             except Exception as e:
                 logger.error(f"startup notice failed: {e}")
 
+    def _class_gates(self):
+        """[(cls, tradeable, text)] for every trained class, from the ONE gate
+        FastTrader uses - so the log, the startup notice and the trades can
+        never disagree about what is being traded."""
+        if not self.fast_mode or not self.intraday:
+            return []
+        metrics = self.intraday.metrics or {}
+        return [(cls, *class_gate(cls, metrics[cls])) for cls in sorted(metrics)]
+
+    def _gate_lines(self) -> str:
+        return "\n".join(f"{'✅' if ok else '⛔'} {_icon(cls)} {cls}: {text}"
+                         for cls, ok, text in self._class_gates())
+
+    def _held_prices(self) -> dict:
+        """Quotes for held symbols only, keyed by symbol. A failed lookup is
+        left out so get_equity() values that position at avg_price."""
+        prices = {}
+        for p in self.budget_tracker.get_positions():
+            try:
+                q = self.engine.latest_price(p['symbol'])
+            except Exception as exc:
+                logger.warning(f"quote failed for {p['symbol']}: {exc}")
+                q = None
+            if q:
+                prices[p['symbol']] = float(q)
+        return prices
+
+    def _add_account_fields(self, e, s=None):
+        """The Balance / Buying power / Unsettled trio every money embed shows.
+        Prefers the cycle summary's figures (quoted this cycle, no second
+        lookup) and falls back to the ledger."""
+        s = s or {}
+        bt = self.budget_tracker
+        equity = s.get('equity')
+        bp = s.get('buying_power')
+        unsettled = s.get('unsettled')
+        if equity is None:
+            equity = bt.get_equity(self._held_prices())
+        if bp is None:
+            bp = bt.get_buying_power()
+        if unsettled is None:
+            unsettled = bt.get_unsettled()
+        e.add_field(name="Balance",
+                    value=f"${equity:,.2f} (started with ${bt.starting_cash():,.2f})",
+                    inline=True)
+        e.add_field(name="Buying power", value=f"${bp:,.2f}", inline=True)
+        e.add_field(name="Unsettled", value=f"${unsettled:,.2f}", inline=True)
+
+    def _startup_embed(self) -> discord.Embed:
+        """The restart notice. Headline and colour come from whether ANY class
+        clears class_gate; 'Nothing will be traded' only when every class is
+        gated (cost floor or EV)."""
+        gates = self._class_gates()
+        will_trade = [cls for cls, ok, _ in gates if ok]
+        metrics = (self.intraday.metrics or {}) if gates else {}
+
+        e = discord.Embed(
+            title="🔄 Trading bot restarted",
+            description=("**Trading is LIVE** - you will hear from me when I buy or sell."
+                         if will_trade else
+                         "**Nothing will be traded right now.** Every asset class is "
+                         "gated (cost floor or expected value), so the bot is watching "
+                         "only. This is the risk gate working, not a crash."),
+            color=discord.Color.green() if will_trade else discord.Color.orange(),
+            timestamp=datetime.now().astimezone())
+
+        for cls, ok, text in gates:
+            m = metrics[cls]
+            e.add_field(
+                name=f"{_icon(cls)} {cls.title()}",
+                value=(f"{'✅' if ok else '⛔'} {text}\n"
+                       f"Gets it right {m.get('precision', 0):.1%} of the time; needs "
+                       f"{m.get('breakeven', 0):.1%} just to break even."),
+                inline=False)
+
+        if not gates:
+            e.add_field(name="Models",
+                        value="No intraday model is loaded - fast mode is off.",
+                        inline=False)
+
+        try:
+            held = self.budget_tracker.get_positions()
+            e.add_field(
+                name="Open paper positions",
+                value=("none" if not held else
+                       ", ".join(f"{qty_str(p['shares'])} {p['symbol']}" for p in held)),
+                inline=False)
+            self._add_account_fields(e)
+        except Exception as exc:
+            logger.warning(f"startup notice: account fields skipped: {exc}")
+
+        e.set_footer(text="Quiet mode: no routine updates. You only hear from me "
+                          "when I trade, or when I restart. PAPER TRADING.")
+        return e
+
     async def _send_startup_notice(self):
         """Post exactly one message on startup saying whether the bot will
         trade and, if not, why.
@@ -464,60 +589,9 @@ class TradingBot(commands.Cog):
         channel = await self._destination()
         if not channel:
             return
+        # _startup_embed quotes held symbols - keep that off the event loop.
+        await channel.send(embed=await asyncio.to_thread(self._startup_embed))
 
-        floor = float(os.getenv('MIN_EV_TO_TRADE', 0.003))
-        metrics = (self.intraday.metrics or {}) if self.fast_mode else {}
-        will_trade = [c for c, m in metrics.items() if m['ev'] >= floor]
-
-        e = discord.Embed(
-            title="🔄 Trading bot restarted",
-            description=("**Trading is LIVE** - you will hear from me when I buy or sell."
-                         if will_trade else
-                         "**Nothing will be traded right now.** Every asset class is "
-                         "below the cost floor, so the bot is watching only. "
-                         "This is the risk gate working, not a crash."),
-            color=discord.Color.green() if will_trade else discord.Color.orange(),
-            timestamp=datetime.now().astimezone())
-
-        for cls, m in sorted(metrics.items()):
-            if m['ev'] >= floor:
-                verdict = f"✅ **Trading.** Edge clears the {floor:.2%} cost floor."
-            elif m['ev'] > 0:
-                verdict = (f"⛔ **Not trading.** Edge of {m['ev'] * 100:+.3f}% per trade "
-                           f"is real but smaller than the {floor:.2%} it costs to get "
-                           f"in and out, so it would lose money after fees.")
-            else:
-                verdict = (f"⛔ **Not trading.** Model loses money "
-                           f"({m['ev'] * 100:+.3f}% per trade) on these settings.")
-            e.add_field(
-                name=f"{cls.title()}",
-                value=(f"{verdict}\n"
-                       f"Gets it right {m['precision']:.1%} of the time; needs "
-                       f"{m['breakeven']:.1%} just to break even."),
-                inline=False)
-
-        if not metrics:
-            e.add_field(name="Models",
-                        value="No intraday model is loaded - fast mode is off.",
-                        inline=False)
-
-        try:
-            held = self.budget_tracker.get_positions()
-            e.add_field(
-                name="Open paper positions",
-                value=("none" if not held else
-                       ", ".join(f"{p['shares']} {p['symbol']}" for p in held)),
-                inline=True)
-            e.add_field(name="Cash left",
-                        value=f"${self.budget_tracker.get_remaining_budget():,.2f}",
-                        inline=True)
-        except Exception:
-            pass
-
-        e.set_footer(text="Quiet mode: no routine updates. You only hear from me "
-                          "when I trade, or when I restart. PAPER TRADING.")
-        await channel.send(embed=e)
-    
     async def _destination(self):
         """Where alerts go: your DM by default, a guild channel if CHANNEL_ID is set.
 
