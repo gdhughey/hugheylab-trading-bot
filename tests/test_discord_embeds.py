@@ -11,6 +11,7 @@ exec_mean_pct / exec_ci / max_drawdown_pct are percentage points, and a class
 without a trained model has bt_precision / ev_bt / ev_bt_net None.
 """
 import asyncio
+import threading
 import types
 from datetime import datetime, timezone
 
@@ -307,6 +308,58 @@ def test_pnl_before_close_does_not_suppress_report(db_path, monkeypatch):
     assert asyncio.run(bot._post_daily_report(DAY, now=NOW)) is True
     assert len(chan.embeds) == 1 and chan.embeds[0].title == f"📊 Paper scorecard — {DAY}"
     assert [r['date'] for r in bot.budget_tracker.equity_series()] == [OPENED_DAY, DAY]
+
+
+def test_daily_summary_waits_for_warm_up(db_path, monkeypatch):
+    """on_ready starts the loop before the warm-up and tasks.loop runs its
+    first iteration at once. A restart after 16:05 ET on a date whose report
+    has not posted must NOT render the scorecard while intraday.metrics is
+    still empty - that would latch report_posted_at on a 'no trained model'
+    report. warming_up is cleared in on_ready's finally, so a failed training
+    still lets the report through on the next tick."""
+    bot = _make_bot(db_path, monkeypatch)
+    posted = []
+
+    async def spy(day_et, now=None):
+        posted.append(day_et)
+        return True
+    monkeypatch.setattr(bot, '_post_daily_report', spy)
+
+    class AfterTheBell(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW.astimezone(tz) if tz else NOW.replace(tzinfo=None)
+    monkeypatch.setattr(discord_bot, 'datetime', AfterTheBell)
+
+    bot.warming_up = True
+    asyncio.run(bot.daily_summary.coro(bot))
+    assert posted == []
+    bot.warming_up = False
+    asyncio.run(bot.daily_summary.coro(bot))
+    assert posted == [DAY]
+
+
+def test_skipped_alert_quotes_off_the_event_loop(db_path, monkeypatch):
+    """_add_account_fields without a cycle summary quotes every held symbol
+    (HTTP). The manual-alert path must run it via asyncio.to_thread like every
+    other latest_price call in the module, so a hanging provider cannot stall
+    reaction handling and slash commands."""
+    bot = _make_bot(db_path, monkeypatch)
+    monkeypatch.setattr(bot.budget_tracker, 'size_order', lambda symbol, price: (0, 0.0, price))
+    seen = []
+    real = bot._add_account_fields
+
+    def recording(e, s=None):
+        seen.append(threading.current_thread())
+        return real(e, s)
+    monkeypatch.setattr(bot, '_add_account_fields', recording)
+
+    chan = FakeChannel()
+    signal = {'symbol': 'AAPL', 'signal': 1, 'price': 100.0, 'probability': 0.6}
+    asyncio.run(bot.send_trade_alert(chan, signal))
+    assert len(chan.embeds) == 1 and chan.embeds[0].title == '⚠️ SKIPPED: AAPL'
+    assert {'Balance', 'Buying power', 'Unsettled'} <= {f.name for f in chan.embeds[0].fields}
+    assert seen and all(t is not threading.main_thread() for t in seen)
 
 
 def test_fast_action_embed_reads_ledger_fields(db_path, monkeypatch):

@@ -609,7 +609,16 @@ class TradingBot(commands.Cog):
         """Post the day's scorecard once, any time after 16:05 ET - weekends
         and holidays included, so a quiet Saturday still proves the account is
         alive. The once-per-date guard is day_state.report_posted_at, not
-        memory, so a restart inside the window cannot double-post."""
+        memory, so a restart inside the window cannot double-post.
+
+        on_ready starts this loop before the warm-up (the report must post
+        even when training fails), and tasks.loop runs the first iteration at
+        once. Skip while warming up: a restart after 16:05 ET on an unposted
+        date would otherwise render every class as 'no trained model' and
+        latch report_posted_at on it. warming_up is cleared in on_ready's
+        finally, so a failed training still lets the report through."""
+        if self.warming_up:
+            return
         now = datetime.now(ET)
         if now.time() < dtime(16, 5):
             return
@@ -1054,7 +1063,9 @@ class TradingBot(commands.Cog):
                     title=f"⚠️ SKIPPED: {symbol}",
                     description="Insufficient buying power",
                     color=discord.Color.orange())
-                self._add_account_fields(embed)
+                # No cycle summary here, so this quotes held symbols (HTTP) -
+                # keep it off the event loop like every other latest_price call.
+                await asyncio.to_thread(self._add_account_fields, embed)
                 await channel.send(embed=embed)
                 return
         else:
@@ -1089,7 +1100,7 @@ class TradingBot(commands.Cog):
             if side == 'SELL':
                 done.add_field(name="Realised", value=_signed_usd(row['realized_pnl']),
                                inline=True)
-            self._add_account_fields(done)
+            await asyncio.to_thread(self._add_account_fields, done)   # quotes held symbols
             pos = next((p for p in bt.get_positions() if p['symbol'] == symbol), None)
             if pos:
                 done.add_field(name="You now hold",
@@ -1118,8 +1129,8 @@ class TradingBot(commands.Cog):
         embed.add_field(name="Confidence", value=f"{prob:.2%}", inline=True)
         # Spec section 4: Balance beside Buying power on every money embed,
         # the approval one included. (Buying power already reflects this
-        # trade's PENDING hold.)
-        self._add_account_fields(embed)
+        # trade's PENDING hold.) Quotes held symbols - off the event loop.
+        await asyncio.to_thread(self._add_account_fields, embed)
         embed.add_field(name="Approval Timeout", value="5 minutes", inline=True)
         embed.set_footer(text=f"Trade ID: {trade_id} | ✅ approve / ❌ reject "
                               f"| PAPER TRADING - no broker connected")
@@ -1208,7 +1219,7 @@ class TradingBot(commands.Cog):
                             value=f"${row['amount']:.2f} (fees ${row['fees']:.2f})")
             if row['side'] == 'SELL':
                 embed.add_field(name="Realised", value=_signed_usd(row['realized_pnl']))
-            self._add_account_fields(embed)
+            await asyncio.to_thread(self._add_account_fields, embed)   # quotes held symbols
 
         await channel.send(embed=embed)
         del self.pending_approvals[trade_id]
