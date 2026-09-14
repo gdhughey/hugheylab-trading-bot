@@ -115,7 +115,9 @@ def _stub_report_plumbing(bot, monkeypatch, chan, stub_embed=True):
 
 NOW = datetime(2026, 9, 19, 20, 10, tzinfo=timezone.utc)   # Saturday 16:10 ET
 DAY = '2026-09-19'
-OPENED_DAY = '2026-01-01'                                   # conftest OPENED_AT
+# conftest OPENED_AT is 2026-01-01T00:00Z, which is 19:00 ET on New Year's
+# Eve: equity_series() day 0 is the ET date of opened_at (contract, Task 4).
+OPENED_DAY = '2025-12-31'
 
 
 def test_startup_embed_live_when_ev_ignored(db_path, monkeypatch):

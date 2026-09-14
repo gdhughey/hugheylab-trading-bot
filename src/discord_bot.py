@@ -411,12 +411,17 @@ class TradingBot(commands.Cog):
 
         logger.info("📊 Starting trading monitor...")
 
+        # The daily scorecard must post even when training fails or fast mode
+        # is off: it is the one message that says whether the account is alive.
+        if not self.daily_summary.is_running():
+            self.daily_summary.start()
+
         # Startup fetch (~110s) and training (~130s) are synchronous. Run them
         # OFF the event loop - inline they block every interaction for minutes
         # and Discord answers slash commands with "application did not respond".
         # A PENDING trade's approval watcher lives in memory, so anything left
         # PENDING by a previous run can never be approved - it would just hold
-        # budget forever. Clear them at startup.
+        # buying power forever. Clear them at startup.
         try:
             stale = self.budget_tracker.conn.execute(
                 "SELECT id, symbol, side FROM trades WHERE status = 'PENDING'").fetchall()
@@ -448,23 +453,17 @@ class TradingBot(commands.Cog):
                 logger.info("⚡ FAST MODE - preparing intraday model...")
                 await asyncio.to_thread(self.intraday.full_fetch)
                 if await asyncio.to_thread(self.intraday.train):
-                    for cls, m in sorted((self.intraday.metrics or {}).items()):
-                        _floor = float(os.getenv('MIN_EV_TO_TRADE', 0.003))
-                        if m['ev'] >= _floor:
-                            verdict = "tradeable"
-                        elif m['ev'] > 0:
-                            verdict = (f"EV +{m['ev'] * 100:.3f}% is under the "
-                                       f"{_floor:.2%} cost floor - will not trade")
-                        else:
-                            verdict = "NEGATIVE EV - will not trade"
+                    # Logged once per class at startup, from the same gate the
+                    # trader applies, so the log never contradicts the trades.
+                    for cls, ok, text in self._class_gates():
+                        m = self.intraday.metrics[cls]
                         logger.info(f"⚡ {cls} model ready: precision "
                                     f"{m['precision']:.1%} vs breakeven "
                                     f"{m['breakeven']:.1%}, EV {m['ev'] * 100:+.3f}%/trade "
-                                    f"({verdict}), bar p>{m['bar']:.3f}")
+                                    f"- {'TRADEABLE' if ok else 'GATED'}: {text}; "
+                                    f"bar p>{m['bar']:.3f}")
                     if not self.fast_cycle.is_running():
                         self.fast_cycle.start()
-                    if not self.daily_summary.is_running():
-                        self.daily_summary.start()
                     state, desc = market_state()
                     logger.info(f"⚡ Fast loop started every "
                                 f"{os.getenv('FAST_POLL_SECONDS', 60)}s - market is {desc}")
@@ -624,26 +623,74 @@ class TradingBot(commands.Cog):
 
     @tasks.loop(minutes=5)
     async def daily_summary(self):
-        """Post one wrap-up after the close: what happened, and tomorrow's plan."""
+        """Post the day's scorecard once, any time after 16:05 ET - weekends
+        and holidays included, so a quiet Saturday still proves the account is
+        alive. The once-per-date guard is day_state.report_posted_at, not
+        memory, so a restart inside the window cannot double-post."""
         now = datetime.now(ET)
-        if now.weekday() >= 5:
+        if now.time() < dtime(16, 5):
             return
-        # Fire once, in the window just after the bell.
-        if not (dtime(16, 5) <= now.time() <= dtime(16, 30)):
-            return
-        today = now.date()
-        if self._last_daily_summary == today:
-            return
-        channel = await self._destination()
-        if not channel:
-            return
+        day_et = now.strftime('%Y-%m-%d')
         try:
-            embed = await asyncio.to_thread(self._daily_summary_embed, today)
+            await self._post_daily_report(day_et)
+        except Exception:
+            logger.exception(f"Daily report for {day_et} failed - retrying next tick")
+
+    def _close_the_books(self, day_et: str, now=None):
+        """Steps 1-2 of the 16:05 tick: label pending signals, then freeze the
+        day's equity row. Runs BEFORE any Discord call so the record of the
+        day never depends on delivery."""
+        bt = self.budget_tracker
+        # label_pending commits per row (`with conn:`). On the ledger's own
+        # connection that commit would also commit whatever the fast-cycle
+        # thread has half-done inside BudgetTracker._txn() - crypto keeps that
+        # loop alive after the bell - and a later rollback there would then
+        # have nothing to undo. So the labelling pass gets its own connection
+        # to the same file (PRAGMA database_list names it) and closes it after.
+        path = bt.conn.execute("PRAGMA database_list").fetchone()['file']
+        conn = connect(path)
+        try:
+            n = signal_log.label_pending(conn, now=now)
+        finally:
+            conn.close()
+        row = bt.record_equity(day_et, self._held_prices(), now=now)
+        logger.info(f"{day_et}: labelled {n} signal(s); equity ${row['equity']:,.2f} recorded")
+
+    async def _post_daily_report(self, day_et: str, now=None) -> bool:
+        """One attempt at the daily report. Returns True when it was posted
+        (embed or text fallback), False when already posted or undeliverable.
+        Any other exception propagates so the loop logs it and retries."""
+        bt = self.budget_tracker
+        state = bt.get_day_state(day_et)
+        if state is None:
+            # No cycle ran today (weekend, holiday, fast mode off) - the report
+            # still needs a baseline row to hang its flag on.
+            state = await asyncio.to_thread(
+                lambda: bt.ensure_day_state(day_et, bt.get_equity(self._held_prices())))
+        if state['report_posted_at']:
+            return False
+
+        await asyncio.to_thread(self._close_the_books, day_et, now)
+
+        channel = await self._destination()
+        if channel is None:
+            logger.error(f"Daily report for {day_et}: no Discord destination - "
+                         f"retrying next tick")
+            return False
+        try:
+            embed = await asyncio.to_thread(self._scorecard_embed, day_et, now)
             await channel.send(embed=embed)
-            self._last_daily_summary = today
-            logger.info(f"Posted daily summary for {today}")
-        except Exception as e:
-            logger.error(f"Daily summary failed: {e}")
+        except discord.HTTPException as exc:
+            # Discord refused the embed itself (too long, bad field). A one-liner
+            # still carries the headline; the flag is set so we do not spam.
+            logger.error(f"Daily report embed for {day_et} rejected by Discord: {exc}")
+            pnl = await asyncio.to_thread(bt.get_pnl, self.engine.latest_price)
+            await channel.send(
+                f"📊 Paper scorecard {day_et}: all-time {_signed_usd(pnl['all_time_net'])} "
+                f"({pnl['all_time_pct']:+.2%}) — full report failed: {exc}")
+        bt.set_day_flag(day_et, 'report_posted_at')
+        logger.info(f"Posted daily report for {day_et}")
+        return True
 
     def _scorecard_embed(self, day_et: str, now=None) -> discord.Embed:
         """Render build_scorecard() for one ET date. Shared by the 16:05
@@ -786,96 +833,6 @@ class TradingBot(commands.Cog):
         e.set_footer(text="Backtest scores timeouts/EOD as −sl, assumes exact-barrier "
                           "fills, and samples intrabar highs/lows; live exits are checked "
                           "on one quote every FAST_POLL_SECONDS. PAPER TRADING.")
-        return e
-
-    def _daily_summary_embed(self, day):
-        """Today's realised result plus what the bot intends to do tomorrow."""
-        conn = self.budget_tracker.conn
-        rows = conn.execute(
-            "SELECT symbol, side, shares, price, amount, realized_pnl, created_at "
-            "FROM trades WHERE status = 'EXECUTED' AND date(created_at) = ? "
-            "ORDER BY id", (day.isoformat(),)).fetchall()
-
-        closed = [r for r in rows if r['realized_pnl'] is not None]
-        buys = [r for r in rows if r['side'] == 'BUY']
-        realized = sum(r['realized_pnl'] for r in closed)
-        wins = [r for r in closed if r['realized_pnl'] > 0]
-        losses = [r for r in closed if r['realized_pnl'] < 0]
-
-        pnl = self.budget_tracker.get_pnl(self.engine.latest_price)
-        positions = pnl['positions']
-        total_day = realized + pnl['unrealized']
-
-        colour = (discord.Color.green() if total_day > 0 else
-                  discord.Color.red() if total_day < 0 else discord.Color.greyple())
-        e = discord.Embed(
-            title=f"🔔 Daily wrap — {day.strftime('%A %d %B')}",
-            color=colour, timestamp=datetime.now().astimezone())
-
-        arrow = "📈 UP" if realized > 0 else "📉 DOWN" if realized < 0 else "➖ FLAT"
-        money = (f"**{arrow} ${abs(realized):,.2f}** booked today\n"
-                 f"{len(buys)} buy(s), {len(closed)} position(s) closed")
-        if closed:
-            money += (f"\nWon {len(wins)} · lost {len(losses)} "
-                      f"({len(wins) / len(closed):.0%} win rate)")
-        if positions:
-            money += (f"\nStill open: **${pnl['unrealized']:+,.2f}** unrealised "
-                      f"across {len(positions)} position(s)")
-        e.add_field(name="💰 Today", value=money, inline=False)
-
-        if closed:
-            e.add_field(
-                name="📋 Closed today",
-                value="\n".join(
-                    f"{'🟩' if r['realized_pnl'] > 0 else '🟥'} **{r['symbol']}** "
-                    f"{r['shares']} @ ${r['price']:,.2f} → **${r['realized_pnl']:+,.2f}**"
-                    for r in closed[:10]),
-                inline=False)
-
-        if positions:
-            e.add_field(
-                name="🌙 Holding overnight",
-                value="\n".join(
-                    f"{'🪙' if p['symbol'].endswith('-USD') else '📈'} **{p['symbol']}** "
-                    f"x{p['shares']} @ ${p['avg_price']:,.2f}"
-                    + (f" → ${p['price']:,.2f} (**{p['pnl_pct']:+.2%}**)"
-                       if p.get('pnl') is not None else "")
-                    for p in positions),
-                inline=False)
-            e.add_field(
-                name="ℹ️ Why anything is still open",
-                value=("Stocks are flattened before the bell, so anything here is "
-                       "crypto — it trades overnight and through the weekend."),
-                inline=False)
-
-        # ---- tomorrow ----
-        plan = []
-        metrics = (self.intraday.metrics if self.intraday else {}) or {}
-        for cls, m in sorted(metrics.items()):
-            verdict = ("will trade" if m['ev'] > 0 else
-                       "**blocked — negative expected value**")
-            plan.append(f"{'🪙' if cls == 'crypto' else '📈'} **{cls}**: "
-                        f"precision {m['precision']:.1%} vs break-even "
-                        f"{m['breakeven']:.1%} → EV {m['ev'] * 100:+.3f}%/trade, {verdict}")
-        cash = self.budget_tracker.get_remaining_budget()
-        plan.append(f"💵 **${cash:,.2f}** of ${self.budget_tracker.weekly_budget:,.2f} "
-                    f"budget available")
-        if self.fast:
-            rules = " · ".join(
-                f"{'🪙' if c == 'crypto' else '📈'} {c} +{barriers(c)[0]:.1%}/"
-                f"−{barriers(c)[1]:.1%}"
-                for c in sorted((self.intraday.metrics if self.intraday else {}) or {}))
-            plan.append(f"🎯 Up to **{self.fast.max_positions}** positions · "
-                        + (rules or "no models trained"))
-        nxt = day + timedelta(days=1)
-        while nxt.weekday() >= 5:
-            nxt += timedelta(days=1)
-        plan.append(f"⏰ Stocks resume **09:30 ET {nxt.strftime('%a %d %b')}**; "
-                    f"crypto keeps trading tonight.")
-        e.add_field(name="🗺️ Game plan for tomorrow", value="\n".join(plan), inline=False)
-
-        e.set_footer(text="PAPER TRADING — no broker, no real money. "
-                          "One good day is not evidence; judge it over weeks.")
         return e
 
     @tasks.loop(seconds=float(os.getenv('FAST_POLL_SECONDS', 60)))
