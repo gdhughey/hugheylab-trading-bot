@@ -106,3 +106,30 @@ def test_stored_symbols_excludes_benchmark_rows_written_directly(engine):
     _insert_closes(engine.conn, 'AAPL', {'2026-09-14': 230.0})
 
     assert engine._stored_symbols() == ['AAPL']
+
+
+def test_stored_close_and_latest_price_read_the_newest_spy_bar(engine):
+    _insert_closes(engine.conn, 'SPY', {
+        '2026-09-11': 640.0, '2026-09-14': 650.0, '2026-09-15': 655.0})
+
+    assert engine.stored_close('SPY') == 655.0
+    # No quote providers in this fixture, so latest_price falls back to the
+    # stored close - the path the scorecard's "last close" uses off-hours.
+    assert engine.latest_price('SPY') == 655.0
+
+
+def test_first_close_on_or_after(engine):
+    _insert_closes(engine.conn, 'SPY', {
+        '2026-09-11': 640.0, '2026-09-14': 650.0, '2026-09-15': 655.0})
+
+    # Exact date match is inclusive.
+    assert engine.first_close_on_or_after('SPY', '2026-09-14') == 650.0
+    # Account opened on a Saturday: the first bar after it is Monday's.
+    assert engine.first_close_on_or_after('SPY', '2026-09-12') == 650.0
+    # A full UTC ISO timestamp (account.opened_at) is truncated to its date,
+    # so the bar on that date is still included rather than string-comparing
+    # past it.
+    assert engine.first_close_on_or_after('SPY', '2026-09-14T13:30:00+00:00') == 650.0
+    # Nothing stored on or after the date, or an unknown symbol -> None.
+    assert engine.first_close_on_or_after('SPY', '2026-09-16') is None
+    assert engine.first_close_on_or_after('QQQ', '2026-09-14') is None

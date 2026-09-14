@@ -357,6 +357,23 @@ class TradingSignalEngine:
         except Exception:
             return None
 
+    def first_close_on_or_after(self, symbol: str, date_iso: str):
+        """Earliest stored daily close dated `date_iso` or later, else None.
+
+        The scorecard's SPY buy-and-hold line starts the day the paper account
+        opened; if that fell on a weekend or holiday, the first bar after it
+        is the price a buy-and-hold investor would actually have paid.
+        `date_iso` may be a bare date or a full ISO timestamp (account.opened_at)
+        - only the date part is compared, because 'YYYY-MM-DDTHH:MM' sorts
+        after 'YYYY-MM-DD' and would silently skip that day's bar.
+        """
+        row = self.conn.execute(
+            "SELECT close FROM prices WHERE symbol = ? AND date >= ? "
+            "ORDER BY date ASC LIMIT 1",
+            (symbol, date_iso[:10]),
+        ).fetchone()
+        return float(row['close']) if row else None
+
     def latest_price(self, symbol: str):
         """Live quote if any provider can give one, else the last stored close.
 
