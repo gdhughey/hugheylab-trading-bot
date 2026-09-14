@@ -645,6 +645,149 @@ class TradingBot(commands.Cog):
         except Exception as e:
             logger.error(f"Daily summary failed: {e}")
 
+    def _scorecard_embed(self, day_et: str, now=None) -> discord.Embed:
+        """Render build_scorecard() for one ET date. Shared by the 16:05
+        report, /pnl and /summary so there is one layout to get right.
+
+        Units follow Task 7's contract: exec_mean_pct, exec_ci and
+        max_drawdown_pct are PERCENTAGE POINTS (formatted with :f and a literal
+        %); every other rate is a fraction (formatted with :%). A class without
+        a trained model has bt_precision / ev_bt_net None and prints n/a - the
+        report must render even when training failed or fast mode is off.
+
+        Every list field goes through _clip_lines: Discord refuses the whole
+        message when any field passes 1024 chars or the total passes 6000.
+        """
+        sc = build_scorecard(self.budget_tracker, self.engine, self.intraday,
+                             day_et, now=now)
+        h, acct, today = sc['headline'], sc['account'], sc['today']
+        opened = _et_date(self.budget_tracker.opened_at())   # ET date; an evening open is already tomorrow in UTC
+        net = h['all_time_net']
+        colour = (discord.Color.green() if net > 0 else
+                  discord.Color.red() if net < 0 else discord.Color.greyple())
+        e = discord.Embed(title=f"📊 Paper scorecard — {day_et}", color=colour,
+                          timestamp=datetime.now().astimezone())
+
+        # The $ headline is never shown without its n and CI (spec section 8).
+        e.add_field(
+            name=f"All-time: {_signed_usd(net)} ({h['all_time_pct']:+.2%})",
+            value=(f"since {opened} · n={h['n_closed']} closed trade(s), "
+                   f"95% CI ±${h['ci_dollars']:,.2f}"),
+            inline=False)
+
+        classes = sc['classes']
+        e.add_field(
+            name="Verdict",
+            value=_clip_lines([f"{_icon(cls)} **{cls}: {c['verdict']}** — {c['verdict_text']}"
+                               for cls, c in sorted(classes.items())]) or "no classes scored",
+            inline=False)
+
+        # unsettled_until is already the ET date ('YYYY-MM-DD') on which the
+        # proceeds settle at 09:30 ET; print it as-is, no timezone maths.
+        settles = ""
+        if acct['unsettled'] > 0 and acct.get('unsettled_until'):
+            settles = f" (settles {acct['unsettled_until']} 09:30 ET)"
+        e.add_field(
+            name="Account",
+            value=(f"Gross P&L {_signed_usd(acct['gross_pnl'])} · "
+                   f"fees paid ${acct['fees_paid']:,.2f}\n"
+                   f"Balance **${acct['equity']:,.2f}** "
+                   f"(started with ${acct['starting_cash']:,.2f})\n"
+                   f"Cash ${acct['cash']:,.2f} · buying power ${acct['buying_power']:,.2f}\n"
+                   f"Unsettled ${acct['unsettled']:,.2f}{settles}"),
+            inline=False)
+
+        block = ("🛑 daily-loss block TRIPPED" if today['loss_tripped']
+                 else "daily-loss block not tripped")
+        # Spec section 1: the next open comes from the trading calendar, so a
+        # Friday, weekend or holiday-eve report names the right day.
+        resume = next_trading_day_open(datetime.fromisoformat(day_et).replace(tzinfo=ET))
+        e.add_field(
+            name=f"Today ({day_et})",
+            value=(f"Realised {_signed_usd(today['realized'])} · "
+                   f"unrealised {_signed_usd(today['unrealized'])}\n"
+                   f"{today['n_trades']} trade(s) · won {today['wins']} · "
+                   f"lost {today['losses']}\n{block}\n"
+                   f"⏰ Stocks resume {resume.strftime('%a %d %b')} 09:30 ET; "
+                   f"crypto keeps trading."),
+            inline=False)
+
+        if sc['closed_today']:
+            e.add_field(
+                name="Closed today",
+                value=_clip_lines([
+                    f"{'🟩' if r['net'] > 0 else '🟥'} {qty_str(r['shares'])} "
+                    f"{r['symbol']} @ ${r['price']:,.2f} → **{_signed_usd(r['net'])}** "
+                    f"(gross {_signed_usd(r['gross'])}, fees ${r['fees']:,.2f}) "
+                    f"[{r['exit_reason']}]"
+                    for r in sc['closed_today'][:10]]),
+                inline=False)
+
+        if sc['positions']:
+            lines = []
+            for p in sc['positions']:
+                head = (f"{_icon(asset_class(p['symbol']))} {qty_str(p['shares'])} "
+                        f"{p['symbol']} @ ${p['avg_price']:,.2f}")
+                if p['price'] is None:
+                    lines.append(f"{head} → price unavailable")
+                    continue
+                # pct_vs_ref is the ref-to-ref move the exit rule watches, not
+                # the move against avg_price (which has the fill costs in it).
+                pct = ("" if p['pct_vs_ref'] is None
+                       else f" ({p['pct_vs_ref']:+.2%} vs entry ref)")
+                lines.append(f"{head} → ${p['price']:,.2f}{pct}")
+            e.add_field(name="Open positions", value=_clip_lines(lines), inline=False)
+
+        so = sc['since_open']
+        pf = so['profit_factor']
+        pf_txt = f"{pf:.2f}" if pf is not None and math.isfinite(pf) else "n/a"
+        e.add_field(
+            name="Scorecard since open",
+            value=(f"{so['n_closed']} trade(s) closed · win rate {so['win_rate']:.1%} "
+                   f"(95% CI {so['win_lo']:.1%}–{so['win_hi']:.1%})\n"
+                   f"Mean net per trade {_signed_usd(so['mean_net'])} ± ${so['mean_ci']:,.2f}\n"
+                   f"Profit factor {pf_txt} · max drawdown {so['max_drawdown_pct']:.2f}% · "
+                   f"{so['days_running']} day(s) running"),
+            inline=False)
+
+        for cls, c in sorted(classes.items()):
+            exits = ", ".join(f"{r}: {v['n']} ({_signed_usd(v['mean_net'])})"
+                              for r, v in sorted(c['exits_by_reason'].items())) or "none"
+            if c['bt_precision'] is None:
+                bt_txt = "walk-forward precision n/a (no trained model)"
+            else:
+                bt_txt = (f"walk-forward precision {c['bt_precision']:.1%} "
+                          f"(n={c['bt_n']:,})")
+            ev_txt = "n/a" if c['ev_bt_net'] is None else f"{c['ev_bt_net']:+.3%}/trade"
+            e.add_field(
+                name=f"{_icon(cls)} {cls.title()} — {c['exec_n']} closed",
+                value=(f"Exits: {exits}\n"
+                       f"TP-first {c['tp_first_rate']:.1%} (95% CI {c['tp_lo']:.1%}–"
+                       f"{c['tp_hi']:.1%}) vs {bt_txt}\n"
+                       f"Backtest EV net of costs {ev_txt} vs realised "
+                       f"{c['exec_mean_pct']:+.3f}% ± {c['exec_ci']:.3f}%\n"
+                       f"Gate: {c['gate_text']}\n"
+                       f"Signals: n={c['sig_n']} labelled, TP-first {c['sig_rate']:.1%} "
+                       f"(95% CI {c['sig_lo']:.1%}–{c['sig_hi']:.1%}, day-clustered low "
+                       f"{c['sig_lo_day']:.1%}) vs cost-adjusted breakeven "
+                       f"{cost_breakeven(cls):.1%}"),
+                inline=False)
+
+        spy = sc.get('spy')
+        if spy:
+            e.add_field(
+                name="SPY buy-and-hold (context only)",
+                value=(f"${acct['starting_cash']:,.2f} in SPY on {opened} → "
+                       f"**${spy['value']:,.2f}** ({spy['pct']:+.2%}; "
+                       f"${spy['start_close']:,.2f} → ${spy['last_close']:,.2f})\n"
+                       f"Not risk-matched: SPY is exposed 24/7, the bot is flat overnight."),
+                inline=False)
+
+        e.set_footer(text="Backtest scores timeouts/EOD as −sl, assumes exact-barrier "
+                          "fills, and samples intrabar highs/lows; live exits are checked "
+                          "on one quote every FAST_POLL_SECONDS. PAPER TRADING.")
+        return e
+
     def _daily_summary_embed(self, day):
         """Today's realised result plus what the bot intends to do tomorrow."""
         conn = self.budget_tracker.conn
@@ -1173,45 +1316,13 @@ class TradingBot(commands.Cog):
         
         return embed
     
-    async def _embed_pnl(self):
-        data = await asyncio.to_thread(
-            self.budget_tracker.get_pnl, self.engine.latest_price)
-
-        total = data['total']
-        color = (discord.Color.green() if total > 0
-                 else discord.Color.red() if total < 0 else discord.Color.greyple())
-        embed = discord.Embed(
-            title="📈 Paper P&L",
-            description="Simulated - no broker order was ever placed",
-            color=color,
-        )
-        embed.add_field(name="Realized", value=f"${data['realized']:,.2f}", inline=True)
-        embed.add_field(name="Unrealized", value=f"${data['unrealized']:,.2f}", inline=True)
-        embed.add_field(name="Total", value=f"${total:,.2f}", inline=True)
-
-        if data['cost_basis']:
-            embed.add_field(name="Cost Basis", value=f"${data['cost_basis']:,.2f}", inline=True)
-            embed.add_field(name="Market Value", value=f"${data['market_value']:,.2f}", inline=True)
-            embed.add_field(name="Return", value=f"{data['return_pct']:.2%}", inline=True)
-
-        for pos in data['positions'][:10]:
-            if pos['pnl'] is None:
-                embed.add_field(name=pos['symbol'], value="price unavailable", inline=False)
-            else:
-                embed.add_field(
-                    name=f"{pos['symbol']} x{pos['shares']}",
-                    value=(f"avg ${pos['avg_price']:.2f} -> ${pos['price']:.2f}  "
-                           f"**${pos['pnl']:+,.2f}** ({pos['pnl_pct']:+.2%})"),
-                    inline=False,
-                )
-
-        if not data['positions']:
-            embed.add_field(name="Open positions", value="none", inline=False)
-        if data['stale']:
-            embed.add_field(name="⚠️ Stale", value=", ".join(data['stale']), inline=False)
-
-        embed.set_footer(text="PAPER TRADING - prices are the latest stored close")
-        return embed
+    async def _embed_pnl(self, now=None):
+        """/pnl and /summary: today's scorecard. Never writes day_state or
+        equity_history - only the 16:05 tick does that. `now` (UTC, tz-aware)
+        is for tests; the slash commands call this with no arguments."""
+        now = now or datetime.now(timezone.utc)
+        day_et = now.astimezone(ET).strftime('%Y-%m-%d')
+        return await asyncio.to_thread(self._scorecard_embed, day_et, now)
 
     async def _embed_scan(self, top: int = 10):
         top = max(1, min(top, 20))
