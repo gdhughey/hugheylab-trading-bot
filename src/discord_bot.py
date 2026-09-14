@@ -856,6 +856,20 @@ class TradingBot(commands.Cog):
                                f"{len(summary['entries'])} in, {len(summary['exits'])} out")
             return
 
+        # Loss-limit announcement, once per ET date. The flag lives in
+        # day_state, so a restart cannot repeat it and a failed send cannot
+        # lose it - the next cycle while tripped simply tries again.
+        if summary.get('loss_announce') or summary.get('loss_tripped'):
+            today_et = summary['ts'].strftime('%Y-%m-%d')
+            try:
+                ds = self.budget_tracker.get_day_state(today_et)
+                if ds is not None and ds['loss_announced_at'] is None:
+                    await channel.send(embed=self._loss_limit_embed(summary))
+                    self.budget_tracker.set_day_flag(today_et, 'loss_announced_at')
+                    logger.info(f"Announced daily loss limit for {today_et}")
+            except Exception as e:
+                logger.error(f"loss-limit announcement failed: {e}")
+
         acted = summary['entries'] or summary['exits']
         gap = float(os.getenv('FAST_SUMMARY_MINUTES', 30))
         # 0 (or less) disables the idle summary entirely: report only when the
@@ -876,7 +890,22 @@ class TradingBot(commands.Cog):
             except Exception as e:
                 logger.error(f"fast summary failed: {e}")
 
+    def _loss_limit_embed(self, s):
+        limit = float(os.getenv('DAILY_LOSS_LIMIT_PCT', 3))
+        e = discord.Embed(
+            title="🛑 Daily loss limit hit — no new entries today",
+            description=(f"Balance is down {limit:g}% or more from this morning's "
+                         f"start, so the bot stops opening positions until the next "
+                         f"ET date. Exits still run for anything open."),
+            color=discord.Color.red(),
+            timestamp=datetime.now().astimezone())
+        self._add_account_fields(e, s)
+        e.set_footer(text="AUTO INTRADAY · PAPER TRADING — no broker, no real money")
+        return e
+
     def _fast_action_embed(self, s):
+        """Every number here is the ledger's: fill, amount, fees and P&L come
+        from the executed row, never recomputed from the quote."""
         e = discord.Embed(
             title="⚡ Intraday activity",
             color=discord.Color.gold(),
@@ -884,24 +913,27 @@ class TradingBot(commands.Cog):
         for x in s['exits']:
             verdict = "🟩 profit" if x['pnl'] > 0 else "🟥 loss" if x['pnl'] < 0 else "flat"
             e.add_field(
-                name=f"SOLD {x['shares']} {x['symbol']} @ ${x['price']:,.2f}",
-                value=(f"Why: {x['reason']}\n"
-                       f"Result: **${x['pnl']:+,.2f}** ({x['pct']:+.2%}) — {verdict}"),
+                name=f"SOLD {qty_str(x['shares'])} {x['symbol']} @ ${x['price']:,.2f}",
+                value=(f"Why: {x['reason']} [{x['exit_reason']}]\n"
+                       f"Result: **{_signed_usd(x['pnl'])}** net ({x['pct']:+.2%} ref-to-ref; "
+                       f"gross {_signed_usd(x['gross'])}, fees ${x['fees']:,.2f}) — {verdict}"),
                 inline=False)
         for x in s['entries']:
+            cls = asset_class(x['symbol'])
             e.add_field(
-                name=f"BOUGHT {x['shares']} {x['symbol']} @ ${x['price']:,.2f}",
-                value=(f"Cost ${x['cost']:,.2f} · model confidence "
-                       f"{x['probability']:.1%}\n"
-                       f"Will sell on **+{barriers(asset_class(x['symbol']))[0]:.1%}** "
-                       f"or **−{barriers(asset_class(x['symbol']))[1]:.1%}**"
+                name=f"BOUGHT {qty_str(x['shares'])} {x['symbol']} @ ${x['price']:,.2f}",
+                value=(f"Cost ${x['cost']:,.2f} (ref ${x['ref_price']:,.2f}, "
+                       f"fees ${x['fees']:,.2f}) · model confidence {x['probability']:.1%}\n"
+                       f"Will sell on **+{barriers(cls)[0]:.1%}** or "
+                       f"**−{barriers(cls)[1]:.1%}** from the reference price"
                        + ("" if is_crypto(x['symbol']) else ", or before the close.")),
                 inline=False)
-        e.add_field(name="Cash left",
-                    value=f"${self.budget_tracker.get_remaining_budget():,.2f}",
-                    inline=True)
+        self._add_account_fields(e, s)
         e.add_field(name="Minutes to close",
                     value=f"{s.get('minutes_to_close', 0):.0f}", inline=True)
+        gates = self._gate_lines()
+        if gates:
+            e.add_field(name="Class gates", value=gates, inline=False)
         e.set_footer(text="AUTO INTRADAY · PAPER TRADING — no broker, no real money")
         return e
 
@@ -927,13 +959,22 @@ class TradingBot(commands.Cog):
                         inline=False)
         e.add_field(
             name="Open positions",
-            value=("\n".join(f"**{p['symbol']}** x{p['shares']} @ ${p['avg_price']:,.2f}"
-                              for p in positions) if positions else "none"),
+            value=("\n".join(f"**{p['symbol']}** x{qty_str(p['shares'])} @ "
+                              f"${p['avg_price']:,.2f}" for p in positions)
+                   if positions else "none"),
             inline=False)
+        gates = self._gate_lines()
+        if gates:
+            e.add_field(name="Class gates", value=gates, inline=False)
+        if s.get('loss_tripped'):
+            e.add_field(name="🛑 Daily loss limit",
+                        value="Tripped for today — no new entries until the next ET "
+                              "date; exits still run.",
+                        inline=False)
         if s.get('note'):
             e.add_field(name="Note", value=s['note'], inline=False)
         e.set_footer(text=f"{s.get('minutes_to_close', 0):.0f} min to close · "
-                          f"PAPER TRADING")
+                          f"buying power ${s.get('buying_power', 0):,.2f} · PAPER TRADING")
         return e
 
     @tasks.loop(minutes=float(os.getenv('CHECK_INTERVAL_MINUTES', 60)))
