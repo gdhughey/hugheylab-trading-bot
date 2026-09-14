@@ -174,7 +174,10 @@ class Database:
         # STARTING_CASH / ACCOUNT_TYPE never touches an opened account: there is
         # deliberately no setter, because restating starting cash would corrupt
         # the all-time return every report is built on.
-        opened_at = (now or datetime.now(timezone.utc)).isoformat(timespec='seconds')
+        # Normalise to UTC: every ledger filter is a lexical compare against
+        # UTC ISO stamps, so a non-UTC offset here would silently exclude rows.
+        opened_at = ((now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+                     .isoformat(timespec='seconds'))
         starting_cash = float(os.getenv('STARTING_CASH', 500))
         account_type = os.getenv('ACCOUNT_TYPE', 'cash').strip().lower()
         with self.conn:

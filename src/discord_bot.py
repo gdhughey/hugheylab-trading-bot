@@ -638,9 +638,9 @@ class TradingBot(commands.Cog):
         # thread has half-done inside BudgetTracker._txn() - crypto keeps that
         # loop alive after the bell - and a later rollback there would then
         # have nothing to undo. So the labelling pass gets its own connection
-        # to the same file (PRAGMA database_list names it) and closes it after.
-        path = bt.conn.execute("PRAGMA database_list").fetchone()['file']
-        conn = connect(path)
+        # to the same file (bt.db_path is exposed for exactly this) and closes
+        # it after.
+        conn = connect(bt.db_path)
         try:
             n = signal_log.label_pending(conn, now=now)
         finally:

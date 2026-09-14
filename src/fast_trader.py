@@ -223,7 +223,12 @@ class FastTrader:
         prices = {}
         for sym, pos in held.items():
             sig = self.engine.signal(sym)
-            prices[sym] = self._price(sym, sig['price'] if sig else pos['avg_price'])
+            # No signal and no quote: fall back to the ENTRY reference, not the
+            # cost basis. avg_price carries slippage/spread, so measured
+            # ref-to-ref it reads as a phantom +spread move on a flat market
+            # and could fire a spurious take-profit. entry_ref means change=0:
+            # only the EOD flatten or the max-hold timeout can close it.
+            prices[sym] = self._price(sym, sig['price'] if sig else pos['entry_ref'])
 
         # INSERT OR IGNORE: a same-date restart keeps the original baseline,
         # so the loss limit cannot be reset by bouncing the service.
