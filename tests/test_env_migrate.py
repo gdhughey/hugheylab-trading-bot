@@ -36,6 +36,9 @@ REQUIRED = {
     'CRYPTO_SPREAD_BPS': '60',
     'DAILY_LOSS_LIMIT_PCT': '3',
     'MIN_ORDER_USD': '1',
+    # 2026-09-17: route the AI analyst to the local GPU box (LXC 202)
+    'LLM_BASE_URL': 'http://192.168.1.249:8081/v1',
+    'LLM_MODEL': 'qwen3-8b',
 }
 REMOVED = ('WEEKLY_BUDGET', 'BUDGET_MODE', 'FAST_MAX_HOLD_MIN')
 

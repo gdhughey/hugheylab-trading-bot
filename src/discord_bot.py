@@ -13,7 +13,7 @@ import math
 from datetime import datetime, timezone, time as dtime
 import logging
 from src import costs, signal_log
-from src.claude_analyzer import ClaudeAnalyzer
+from src.claude_analyzer import ClaudeAnalyzer, build_brief_context, build_risk_context
 from src.budget_tracker import BudgetTracker, _et_date
 from src.costs import qty_str
 from src.database import connect
@@ -1268,27 +1268,41 @@ class TradingBot(commands.Cog):
         embed.add_field(name="Pending Trades", value=str(len(self.pending_approvals)))
         return embed
     
-    async def _embed_daily_brief(self):
-        brief = await self.claude.daily_market_analysis()
+    async def _embed_daily_brief(self, now=None):
+        """/daily_brief: the model narrates a facts block Python built
+        (scorecard, positions, earnings dates, stored headlines). It is
+        never asked what is happening in the market - it has no way to know."""
+        now = now or datetime.now(timezone.utc)
+        day_et = now.astimezone(ET).strftime('%Y-%m-%d')
+        context = await asyncio.to_thread(
+            build_brief_context, self.budget_tracker, self.engine, self.intraday,
+            day_et, self.db.conn, now)
+        brief = await self.claude.daily_market_analysis(context)
 
         embed = discord.Embed(
-            title="📊 Daily Market Brief",
+            title=f"📊 Daily brief — {day_et}",
             description=brief,
             color=discord.Color.blue()
         )
-        embed.set_footer(text="Powered by Claude AI")
+        embed.set_footer(text=f"Narrated by {self.claude.backend_name} from the bot's own numbers")
         return embed
-    
+
     async def _embed_risk_check(self):
-        risk_analysis = await self.claude.analyze_portfolio_risk(
-            self.budget_tracker.get_positions())
+        pnl = await asyncio.to_thread(self.budget_tracker.get_pnl, self.engine.latest_price)
+        tp, sl, _ = barriers('stock')
+        context = build_risk_context(
+            pnl, max_positions=(self.fast.max_positions if self.fast
+                                else int(os.getenv('FAST_MAX_POSITIONS', 3))),
+            stop_loss_pct=sl, take_profit_pct=tp,
+            daily_loss_limit_pct=float(os.getenv('DAILY_LOSS_LIMIT_PCT', 3)))
+        risk_analysis = await self.claude.analyze_portfolio_risk(pnl['positions'], context)
 
         embed = discord.Embed(
             title="⚠️ Risk Assessment",
             description=risk_analysis,
             color=discord.Color.orange()
         )
-        embed.set_footer(text="Powered by Claude AI")
+        embed.set_footer(text=f"Narrated by {self.claude.backend_name} from the bot's own numbers")
         return embed
     
     async def _embed_account(self):
