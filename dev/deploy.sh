@@ -40,9 +40,15 @@ sudo pct exec "$CT" -- bash -s "$APP/.env" < dev/env-migrate.sh
 echo "==> shipping $rev to CT $CT:$APP"
 tar czf - "${EXCLUDES[@]}" . | sudo pct exec "$CT" -- tar xzf - -C "$APP"
 
+# Unit files ship inside the tar but systemd reads /etc; re-install them so a
+# unit change in git is a unit change in the container.
+echo "==> installing systemd units"
+sudo pct exec "$CT" -- bash -c "install -m 644 $APP/proxmox/trading-bot.service $APP/proxmox/trading-collector.service $APP/proxmox/trading-collector.timer /etc/systemd/system/ && systemctl daemon-reload && systemctl enable -q trading-collector.timer && systemctl start trading-collector.timer"
+
 echo "==> restarting trading-bot"
 sudo pct exec "$CT" -- systemctl restart trading-bot
 sudo pct exec "$CT" -- systemctl is-active trading-bot
+sudo pct exec "$CT" -- systemctl is-active trading-collector.timer
 cat <<EOF
 ==> follow it with: sudo pct exec $CT -- journalctl -u trading-bot -f
     expect the startup notice to say "Trading is LIVE" with the stock line

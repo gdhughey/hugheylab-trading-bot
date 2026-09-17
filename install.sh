@@ -34,7 +34,10 @@ python3 -m venv "$APP_DIR/venv"
 
 log "Installing systemd unit"
 install -m 644 "$APP_DIR/proxmox/trading-bot.service" /etc/systemd/system/trading-bot.service
+install -m 644 "$APP_DIR/proxmox/trading-collector.service" /etc/systemd/system/trading-collector.service
+install -m 644 "$APP_DIR/proxmox/trading-collector.timer" /etc/systemd/system/trading-collector.timer
 systemctl daemon-reload
+systemctl enable trading-collector.timer
 
 if [[ ! -f "$APP_DIR/.env" ]]; then
   cp "$APP_DIR/.env.example" "$APP_DIR/.env"

@@ -218,6 +218,56 @@ def minutes_to_close(now=None):
     return (close - now).total_seconds() / 60
 
 
+INTRADAY_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS prices_intraday (
+        symbol TEXT NOT NULL, ts TEXT NOT NULL,
+        open REAL, high REAL, low REAL, close REAL, volume REAL,
+        interval TEXT NOT NULL,
+        PRIMARY KEY (symbol, ts, interval)
+    );
+    CREATE INDEX IF NOT EXISTS idx_intraday_sym
+        ON prices_intraday (symbol, interval, ts);
+"""
+
+
+def ensure_intraday_schema(conn):
+    with conn:
+        conn.executescript(INTRADAY_SCHEMA)
+
+
+def upsert_bars(conn, raw: pd.DataFrame, symbols, interval: str) -> int:
+    """Store one yf.download() result. Returns rows written.
+
+    Shared by the engine's 5m refresh and the 1m collector so both write the
+    same shape: ts is stored exactly as yfinance served it (ET offset for
+    stocks, UTC for crypto) and re-parsed with utc=True on the way out.
+    """
+    if raw is None or raw.empty:
+        return 0
+    total = 0
+    for sym in symbols:
+        try:
+            df = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
+            df = df.rename(columns=str.lower).dropna(subset=['close'])
+            if df.empty:
+                continue
+            rows = [(sym, idx.isoformat(), float(r['open']), float(r['high']),
+                     float(r['low']), float(r['close']), float(r['volume'] or 0),
+                     interval) for idx, r in df.iterrows()]
+            with conn:
+                conn.executemany(
+                    "INSERT INTO prices_intraday "
+                    "(symbol, ts, open, high, low, close, volume, interval) "
+                    "VALUES (?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(symbol, ts, interval) DO UPDATE SET "
+                    "open=excluded.open, high=excluded.high, low=excluded.low, "
+                    "close=excluded.close, volume=excluded.volume", rows)
+            total += len(rows)
+        except (KeyError, Exception):
+            continue
+    return total
+
+
 def _rsi(close, period=14):
     d = close.diff()
     up = d.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
@@ -339,16 +389,7 @@ class IntradayEngine:
         return min(0.95, self.base_rates.get(cls, 0.30) * prob_ratio(cls))
 
     def _ensure_schema(self):
-        with self.conn:
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS prices_intraday (
-                    symbol TEXT NOT NULL, ts TEXT NOT NULL,
-                    open REAL, high REAL, low REAL, close REAL, volume REAL,
-                    interval TEXT NOT NULL,
-                    PRIMARY KEY (symbol, ts, interval)
-                )""")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_intraday_sym "
-                              "ON prices_intraday (symbol, interval, ts)")
+        ensure_intraday_schema(self.conn)
 
     # --- data ------------------------------------------------------------
 
@@ -373,31 +414,7 @@ class IntradayEngine:
         except Exception as e:
             logger.error(f"[intraday] download failed: {e}")
             return 0
-        if raw is None or raw.empty:
-            return 0
-
-        total = 0
-        for sym in symbols:
-            try:
-                df = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
-                df = df.rename(columns=str.lower).dropna(subset=['close'])
-                if df.empty:
-                    continue
-                rows = [(sym, idx.isoformat(), float(r['open']), float(r['high']),
-                         float(r['low']), float(r['close']), float(r['volume'] or 0),
-                         interval) for idx, r in df.iterrows()]
-                with self.conn:
-                    self.conn.executemany(
-                        "INSERT INTO prices_intraday "
-                        "(symbol, ts, open, high, low, close, volume, interval) "
-                        "VALUES (?,?,?,?,?,?,?,?) "
-                        "ON CONFLICT(symbol, ts, interval) DO UPDATE SET "
-                        "open=excluded.open, high=excluded.high, low=excluded.low, "
-                        "close=excluded.close, volume=excluded.volume", rows)
-                total += len(rows)
-            except (KeyError, Exception):
-                continue
-        return total
+        return upsert_bars(self.conn, raw, symbols, interval)
 
     def full_fetch(self, symbols=None, interval=None):
         """Pull the complete history. Used for training, never in the loop."""

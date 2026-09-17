@@ -1,0 +1,14 @@
+[Unit]
+Description=Hourly run of the trading bot data collector
+
+[Timer]
+# Hourly, a few minutes past so it never lands on the bot's own top-of-hour
+# scan. Persistent=true runs a missed hour on boot. Any run that fails is
+# repaired by the next: bars are a 2-day upsert and news is INSERT OR IGNORE.
+OnCalendar=*-*-* *:07:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=trading-collector.service
+
+[Install]
+WantedBy=timers.target

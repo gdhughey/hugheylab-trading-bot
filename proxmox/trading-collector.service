@@ -1,0 +1,28 @@
+[Unit]
+Description=Trading bot data collector (1m bars, company news, earnings calendar)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/opt/trading-bot/.env
+ExecStart=/opt/trading-bot/venv/bin/python -m src.collector all
+# A 1m download for ~90 symbols x 2 days is a few tens of MB in pandas; the
+# S&P-wide universe is ~5x that. Cap it so a bad day here can never starve
+# the bot (1200M cap) inside the 2 GB container.
+MemoryMax=500M
+OOMPolicy=kill
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-collector
+
+# Same hardening as the bot: its own directory and outbound network only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/trading-bot
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
