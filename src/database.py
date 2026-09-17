@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS day_state (
     start_equity      REAL NOT NULL,
     loss_tripped_at   TEXT,
     loss_announced_at TEXT,
-    report_posted_at  TEXT
+    report_posted_at  TEXT,
+    review_posted_at  TEXT                 -- the analyst's loss review went out
 );
 
 CREATE TABLE IF NOT EXISTS equity_history (
@@ -118,6 +119,7 @@ COLUMN_MIGRATIONS = [
     ('trades', 'entry_probability', 'REAL'),
     ('trades', 'exit_reason', 'TEXT'),
     ('positions', 'entry_ref', 'REAL NOT NULL DEFAULT 0'),
+    ('day_state', 'review_posted_at', 'TEXT'),
 ]
 
 

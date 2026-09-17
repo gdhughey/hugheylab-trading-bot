@@ -540,3 +540,68 @@ def test_signal_log_never_commits_a_ledger_transaction_open_on_another_thread(
     assert not budget.conn.in_transaction
     # The signal log itself still landed, on its own connection.
     assert signal_count(budget) == 1
+
+
+# --- open delay + loss review (2026-09-17) ----------------------------------
+
+JUST_OPENED = datetime(2026, 9, 14, 13, 31, 30, tzinfo=timezone.utc)   # 09:31:30 ET
+AFTER_DELAY = datetime(2026, 9, 14, 13, 46, tzinfo=timezone.utc)       # 09:46 ET
+
+
+def test_no_stock_entries_in_the_first_minutes_after_the_open(tmp_path, monkeypatch):
+    monkeypatch.setenv('FAST_OPEN_DELAY_MIN', '15')
+    monkeypatch.setenv('CRYPTO_SPREAD_BPS', '10')     # let crypto through the cost gate
+    budget = make_budget(tmp_path, monkeypatch)
+    engine = FakeEngine(['AAPL', 'BTC-USD'], {'AAPL': 100.0, 'BTC-USD': 50000.0})
+    open_position(budget, 'MSFT', 100.0, 1.0)
+    engine.quotes['MSFT'] = 99.0                       # -1%: the stop must still fire
+    trader = make_trader(engine, budget)
+
+    s = trader.cycle(now=JUST_OPENED)
+    assert [x['exit_reason'] for x in s['exits']] == ['sl']          # exits unaffected
+    assert ('AAPL', 'first 15 min after the open') in s['skipped']
+    assert [e['symbol'] for e in s['entries']] == ['BTC-USD']        # crypto has no open
+
+    s = trader.cycle(now=AFTER_DELAY)
+    assert 'AAPL' in [e['symbol'] for e in s['entries']]
+
+
+def test_loss_review_due_on_consecutive_stops_then_latched(tmp_path, monkeypatch):
+    monkeypatch.setenv('FAST_MAX_POSITIONS', '3')
+    monkeypatch.setenv('REVIEW_CONSECUTIVE_STOPS', '3')
+    monkeypatch.setenv('REVIEW_LOSS_PCT', '50')        # only the stop rule can fire
+    budget = make_budget(tmp_path, monkeypatch)
+    engine = FakeEngine(['AAPL', 'MSFT', 'NVDA'], {'AAPL': 100.0, 'MSFT': 100.0, 'NVDA': 100.0})
+    trader = make_trader(engine, budget)
+    s = trader.cycle(now=NOW)
+    assert len(s['entries']) == 3 and s['review_due'] is False
+
+    for sym in ('AAPL', 'MSFT'):
+        engine.quotes[sym] = 99.0
+    s = trader.cycle(now=NOW + timedelta(minutes=5))
+    assert [x['exit_reason'] for x in s['exits']] == ['sl', 'sl']
+    assert s['review_due'] is False                    # two stops, not three
+
+    engine.quotes['NVDA'] = 99.0
+    s = trader.cycle(now=NOW + timedelta(minutes=10))
+    assert [x['exit_reason'] for x in s['exits']] == ['sl']
+    assert s['review_due'] is True and s['review_reason'] == '3 stop-losses in a row'
+
+    # The poster latches it; the next cycle must not ask again.
+    budget.set_day_flag('2026-09-14', 'review_posted_at')
+    s = trader.cycle(now=NOW + timedelta(minutes=15))
+    assert s['review_due'] is False
+
+
+def test_loss_review_due_on_realised_loss_pct(tmp_path, monkeypatch):
+    monkeypatch.setenv('FAST_MAX_POSITIONS', '1')
+    monkeypatch.setenv('REVIEW_LOSS_PCT', '1')
+    monkeypatch.setenv('REVIEW_CONSECUTIVE_STOPS', '99')
+    budget = make_budget(tmp_path, monkeypatch)
+    engine = FakeEngine(['AAPL'], {'AAPL': 100.0})
+    trader = make_trader(engine, budget)
+    trader.cycle(now=NOW)                              # $500 into AAPL
+    engine.quotes['AAPL'] = 98.0                       # -2% on the whole book = -$10 > 1% of $500
+    s = trader.cycle(now=NOW + timedelta(minutes=5))
+    assert s['exits'] and s['review_due'] is True
+    assert s['review_reason'].startswith('realised -') and '1% of the $500.00 start' in s['review_reason']

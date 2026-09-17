@@ -14,6 +14,7 @@ from datetime import datetime, timezone, time as dtime
 import logging
 from src import costs, signal_log
 from src.claude_analyzer import ClaudeAnalyzer, build_brief_context, build_risk_context
+from src.postmortem import build_postmortem_context
 from src.budget_tracker import BudgetTracker, _et_date
 from src.costs import qty_str
 from src.database import connect
@@ -235,6 +236,19 @@ class TradingBot(commands.Cog):
             except Exception as e:
                 logger.exception("/scan failed")
                 embed = discord.Embed(title="/scan failed", description=str(e),
+                                      color=discord.Color.red())
+            await interaction.followup.send(embed=embed)
+
+        @tree.command(name='postmortem',
+                      description="AI post-mortem of a day's trades (default today)")
+        @app_commands.describe(date='ET date YYYY-MM-DD (default today)')
+        async def _postmortem(interaction: discord.Interaction, date: str = None):
+            await interaction.response.defer(thinking=True)
+            try:
+                embed = self._warming_embed() or await self._embed_postmortem(date)
+            except Exception as e:
+                logger.exception("/postmortem failed")
+                embed = discord.Embed(title="/postmortem failed", description=str(e),
                                       color=discord.Color.red())
             await interaction.followup.send(embed=embed)
 
@@ -862,6 +876,21 @@ class TradingBot(commands.Cog):
             except Exception as e:
                 logger.error(f"loss-limit announcement failed: {e}")
 
+        # Loss review, once per ET date: the analyst thinks about a bad day
+        # BEFORE the hard limit. Latched in day_state.review_posted_at so a
+        # restart cannot repeat it; a failed send retries next cycle.
+        if summary.get('review_due'):
+            today_et = summary['ts'].strftime('%Y-%m-%d')
+            try:
+                ds = self.budget_tracker.get_day_state(today_et)
+                if ds is not None and ds['review_posted_at'] is None:
+                    await channel.send(embed=await self._embed_postmortem(
+                        today_et, reason=summary.get('review_reason')))
+                    self.budget_tracker.set_day_flag(today_et, 'review_posted_at')
+                    logger.info(f"Posted loss review for {today_et}")
+            except Exception as e:
+                logger.error(f"loss review failed: {e}")
+
         acted = summary['entries'] or summary['exits']
         gap = float(os.getenv('FAST_SUMMARY_MINUTES', 30))
         # 0 (or less) disables the idle summary entirely: report only when the
@@ -1305,6 +1334,27 @@ class TradingBot(commands.Cog):
         embed.set_footer(text=f"Narrated by {self.claude.backend_name} from the bot's own numbers")
         return embed
     
+    async def _embed_postmortem(self, day_et=None, reason=None, now=None):
+        """/postmortem and the automatic loss review: Python reconstructs the
+        day's trades (entry timing, gap vs prior close, 1m path, headlines) and
+        the model says what they had in common."""
+        now = now or datetime.now(timezone.utc)
+        day_et = day_et or now.astimezone(ET).strftime('%Y-%m-%d')
+        datetime.strptime(day_et, '%Y-%m-%d')      # reject junk before it hits SQL
+        context = await asyncio.to_thread(
+            build_postmortem_context, self.db.conn, self.budget_tracker, day_et, reason, now)
+        review = await self.claude.loss_review(context)
+        e = discord.Embed(
+            title=f"🔎 Loss review — {day_et}" if reason else f"🔎 Post-mortem — {day_et}",
+            description=review,
+            color=discord.Color.dark_red() if reason else discord.Color.dark_grey(),
+            timestamp=datetime.now().astimezone())
+        if reason:
+            e.add_field(name="Why now", value=reason, inline=False)
+        e.set_footer(text=f"Narrated by {self.claude.backend_name} from the ledger and stored bars · "
+                          "this changes nothing the bot does")
+        return e
+
     async def _embed_account(self):
         """/account: the paper brokerage account, read-only. There is no setter
         - changing starting cash after open would corrupt the all-time return."""

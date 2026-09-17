@@ -51,29 +51,46 @@ SYSTEM = (
 _NUM = re.compile(r'(?<![\w.])[-+]?\$?\d[\d,]*(?:\.\d+)?%?')
 
 
-def _numbers(text: str) -> set[str]:
-    """Numeric tokens in `text`, normalised (no $ , % or trailing zeros)."""
-    out = set()
+def _numbers(text: str) -> list[float]:
+    """Numeric values in `text` as magnitudes ("a loss of $8.29" is a fair
+    reading of "-$8.29"). Duplicates kept; callers set() what they need."""
+    out = []
     for tok in _NUM.findall(text or ''):
         t = tok.replace('$', '').replace(',', '').rstrip('%').lstrip('+')
         try:
-            v = float(t)
+            out.append(abs(float(t)))
         except ValueError:
             continue
-        # Magnitude only: "a loss of $8.29" is a fair reading of "$-8.29".
-        out.add(f"{abs(v):g}")
     return out
+
+
+def _decimals(tok: str) -> int:
+    return len(tok.split('.')[1]) if '.' in tok else 0
 
 
 def unsourced_numbers(prompt: str, answer: str) -> list[str]:
     """Numbers in the answer that appear nowhere in the prompt.
 
-    Small integers 0-3 are ignored (list ordinals, "two trades" spelled as a
-    digit). Everything else must be traceable to the facts block.
+    A number counts as sourced if some prompt figure ROUNDS to it at the
+    precision the answer used ("0.471" -> "0.47" is a paraphrase, not an
+    invention). Small integers 0-3 are ignored (list ordinals, "two trades"
+    spelled as a digit). Everything else must be traceable to the facts.
     """
     have = _numbers(prompt)
-    return sorted(n for n in _numbers(answer)
-                  if n not in have and not (n.isdigit() and int(n) <= 3))
+    bad = set()
+    for tok in _NUM.findall(answer or ''):
+        t = tok.replace('$', '').replace(',', '').rstrip('%').lstrip('+')
+        try:
+            v = abs(float(t))
+        except ValueError:
+            continue
+        if v == int(v) and v <= 3:
+            continue
+        d = _decimals(t)
+        if any(round(h, d) == v for h in have):
+            continue
+        bad.add(f"{v:g}")
+    return sorted(bad)
 
 
 # --- context builders (Python computes, the model narrates) -------------------
@@ -331,6 +348,31 @@ class ClaudeAnalyzer:
                   "Copy figures exactly as written in the facts.")
         out = await self._ask(prompt, prefer='local', max_tokens=400)
         logger.info("✅ Risk assessment generated")
+        return out
+
+    async def loss_review(self, context: str):
+        """Think about a losing day. `context` comes from
+        postmortem.build_postmortem_context(): the trades, the price paths,
+        the gaps, and the patterns Python already counted."""
+        # An 8B model handed "no trades" will still write a story about the
+        # trades (observed 2026-09-17). Nothing to review means no call.
+        if not context or 'No trades on this date' in context:
+            return "No trades on this date - nothing to review."
+        prompt = (f"FACTS:\n{context}\n\n"
+                  "How to read the facts: 'entry was +X% vs yesterday' means the stock "
+                  "had already GAPPED UP by X% before the bot bought - the bot did not "
+                  "earn that move, it paid up for it. 'model p' is the model's "
+                  "probability at entry; compare it with the others. 'stopped out "
+                  "within N min' means the stop-loss fired that quickly. The same "
+                  "pattern across every trade on a day is a rule problem, not luck.\n\n"
+                  "Write a post-mortem of 4-6 sentences for the trader. First say "
+                  "plainly what the losing trades had in common, using the patterns "
+                  "and figures given. Then say whether this looks like bad luck or a "
+                  "repeatable mistake, and why. Finish with ONE specific question to "
+                  "investigate - about the bot's rules, timing or data - not a trade "
+                  "to place. Copy figures exactly as written in the facts.")
+        out = await self._ask(prompt, prefer='local', max_tokens=500)
+        logger.info("✅ Loss review generated")
         return out
 
     async def weekly_portfolio_review(self, trades, positions, performance):

@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 # The only day_state columns set_day_flag may stamp (the column name is
 # interpolated into SQL, so it must be whitelisted).
-DAY_FLAGS = ('loss_tripped_at', 'loss_announced_at', 'report_posted_at')
+DAY_FLAGS = ('loss_tripped_at', 'loss_announced_at', 'report_posted_at', 'review_posted_at')
 
 
 def _week_key(dt: datetime = None) -> str:

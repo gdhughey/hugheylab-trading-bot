@@ -27,6 +27,9 @@ NOW = datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc)
     ("1,250 shares", "1250 shares", []),                            # comma-insensitive
     ("max drawdown 0.90%", "drawdown of 0.9%", []),                 # trailing zeros
     ("net P&L -$8.29", "a loss of $8.29", []),                       # sign is phrasing
+    ("model p=0.471, p=0.526", "probabilities above 0.47", []),      # rounding is paraphrase
+    ("win rate 51.1%", "about 51%", []),
+    ("win rate 51.1%", "about 52%", ['52']),                         # mis-rounding is not
     ("", "The Fed cut rates by 25bps on 2026-09-16.", ['16', '2026', '25', '9']),   # an invented date is three unsourced numbers
 ])
 def test_unsourced_numbers(prompt, answer, bad):
@@ -177,3 +180,11 @@ def test_disabled_when_nothing_configured(monkeypatch):
     monkeypatch.delenv('CLAUDE_API_KEY', raising=False)
     a = ClaudeAnalyzer()
     assert not a.enabled and a.backend_name == 'disabled'
+
+
+def test_loss_review_with_no_trades_never_calls_the_model(local, monkeypatch):
+    async def boom(*a, **k):
+        raise AssertionError('model must not be called')
+    monkeypatch.setattr(local, '_ask_local', boom)
+    out = asyncio.run(local.loss_review("Loss review for 2026-09-17 (ET).\nNo trades on this date."))
+    assert out == "No trades on this date - nothing to review."

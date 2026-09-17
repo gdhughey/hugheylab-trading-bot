@@ -21,8 +21,8 @@ from datetime import datetime, timedelta, timezone
 
 from src import costs, signal_log
 from src.database import connect
-from src.intraday_engine import (market_state, minutes_to_close, ET, INTERVAL,
-                                 is_crypto, asset_class, barriers)
+from src.intraday_engine import (market_state, minutes_to_close, minutes_since_open,
+                                 ET, INTERVAL, is_crypto, asset_class, barriers)
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,12 @@ class FastTrader:
     def eod_flatten_min(self): return _cfg('FAST_EOD_FLATTEN_MIN', 10)
     @property
     def cooldown_min(self): return _cfg('FAST_COOLDOWN_MIN', 15)
+    @property
+    def open_delay_min(self): return _cfg('FAST_OPEN_DELAY_MIN', 15)
+    @property
+    def review_loss_pct(self): return _cfg('REVIEW_LOSS_PCT', 1.0)
+    @property
+    def review_stops(self): return int(_cfg('REVIEW_CONSECUTIVE_STOPS', 3, int))
 
     def _price(self, symbol, fallback):
         if self.quote_fn:
@@ -306,6 +312,25 @@ class FastTrader:
                            f"the next ET date")
         summary['loss_tripped'] = loss_tripped
 
+        # ---- LOSS REVIEW: ask the analyst to think before the hard limit ----
+        # Fires once per ET date (latched in day_state.review_posted_at by the
+        # poster) when the day's REALISED loss passes REVIEW_LOSS_PCT of the
+        # start equity, or the last REVIEW_CONSECUTIVE_STOPS exits were all
+        # stop-losses. It only reports - the daily loss limit is the control.
+        summary['review_due'] = False
+        if day['review_posted_at'] is None:
+            sells = [r for r in self.budget.get_trades_since_open(today_et) if r['side'] == 'SELL']
+            realised = sum(float(r['realized_pnl'] or 0) for r in sells)
+            tail = [r['exit_reason'] for r in sells[-self.review_stops:]]
+            by_loss = realised <= -day['start_equity'] * self.review_loss_pct / 100
+            by_stops = len(tail) == self.review_stops and all(x == 'sl' for x in tail)
+            if sells and (by_loss or by_stops):
+                summary['review_due'] = True
+                summary['review_reason'] = (
+                    f"realised {realised:+,.2f} today ({self.review_loss_pct:g}% of the "
+                    f"${day['start_equity']:,.2f} start)" if by_loss
+                    else f"{self.review_stops} stop-losses in a row")
+
         # ---- SIGNAL LOG + ENTRIES -----------------------------------------
         # Every scored symbol is logged every cycle (INSERT OR IGNORE on the
         # bar, so the 60 s poll cannot inflate n); candidates are the above-bar
@@ -333,6 +358,12 @@ class FastTrader:
             return summary
 
         near_bell = stocks_open and to_close <= self.eod_flatten_min
+        # The first minutes after the bell are 2-3x as volatile as the rest of
+        # the session and the day's first 5m bar is a gap, not a trend. On
+        # 2026-09-16 and 09-17 every entry was placed by 09:31 and every one
+        # was stopped out by 09:41. Exits are unaffected.
+        since_open = minutes_since_open(now_et)
+        just_opened = stocks_open and since_open < self.open_delay_min
         min_order = _cfg('MIN_ORDER_USD', 1)
         for sig in candidates:
             if slots <= 0:
@@ -353,6 +384,10 @@ class FastTrader:
                 continue
             if near_bell and not is_crypto(sym):
                 summary['skipped'].append((sym, 'too close to the bell'))
+                continue
+            if just_opened and not is_crypto(sym):
+                summary['skipped'].append(
+                    (sym, f'first {self.open_delay_min:g} min after the open'))
                 continue
             if self.cooldown.get(sym, now_et) > now_et:
                 summary['skipped'].append((sym, 'cooling down'))

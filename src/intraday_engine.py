@@ -218,6 +218,38 @@ def minutes_to_close(now=None):
     return (close - now).total_seconds() / 60
 
 
+def minutes_since_open(now=None):
+    """Minutes since 09:30 ET today (negative before the open)."""
+    now = (now or datetime.now(ET)).astimezone(ET)
+    opn = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    return (now - opn).total_seconds() / 60
+
+
+def interval_minutes(interval=None) -> float:
+    """Bar length in minutes for a yfinance interval string: '5m' -> 5, '1h' -> 60."""
+    s = str(interval or INTERVAL).strip().lower()
+    try:
+        return float(s[:-1]) * 60 if s.endswith('h') else float(s.rstrip('m'))
+    except ValueError:
+        return 5.0
+
+
+def completed_bars(h: pd.DataFrame, now=None, interval=None) -> pd.DataFrame:
+    """Drop a trailing bar that is still forming.
+
+    Yahoo serves the in-progress bar with its start time as the index, so at
+    09:31:34 the '09:30' 5m bar is 94 seconds old and still moving. The model
+    was trained on finished bars only; scoring a partial one is a
+    train/execute mismatch, and on 2026-09-16/17 it bought four gap-ups at
+    09:30-09:31 and was stopped out of all eight within eleven minutes.
+    """
+    if h.empty:
+        return h
+    now = now or datetime.now(timezone.utc)
+    end = h.index[-1].to_pydatetime() + timedelta(minutes=interval_minutes(interval))
+    return h.iloc[:-1] if end > now else h
+
+
 INTRADAY_SCHEMA = """
     CREATE TABLE IF NOT EXISTS prices_intraday (
         symbol TEXT NOT NULL, ts TEXT NOT NULL,
@@ -553,12 +585,15 @@ class IntradayEngine:
 
     # --- inference -------------------------------------------------------
 
-    def signal(self, symbol):
+    def signal(self, symbol, now=None):
         cls = asset_class(symbol)
         model = self.models.get(cls)
         if model is None:
             return None
+        now = now or datetime.now(timezone.utc)
         h = self._history(symbol, limit=int(os.getenv('SIGNAL_BARS', 400)))
+        # Score finished bars only - the same bars the model was trained on.
+        h = completed_bars(h, now=now)
         if len(h) < 60:
             return None
         f = build_features(h).replace([np.inf, -np.inf], np.nan).dropna()
@@ -567,8 +602,7 @@ class IntradayEngine:
         # Refuse to act on stale bars. This is the general form of the holiday
         # bug: on 2026-09-07 the bot entered three positions using the previous
         # Friday's bars because nothing checked how old they were.
-        age_min = (datetime.now(timezone.utc) - h.index[-1].to_pydatetime()
-                   ).total_seconds() / 60
+        age_min = (now - h.index[-1].to_pydatetime()).total_seconds() / 60
         max_age = float(os.getenv('MAX_BAR_AGE_MIN', 45))
         if age_min > max_age:
             logger.debug(f"{symbol}: newest bar is {age_min:.0f} min old "

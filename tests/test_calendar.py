@@ -14,8 +14,8 @@ from src.intraday_engine import (ET, US_HOLIDAYS_2026, is_trading_day,
                                  market_state, next_trading_day_open)
 
 
-def et(y, m, d, hh, mm):
-    return datetime(y, m, d, hh, mm, tzinfo=ET)
+def et(y, m, d, hh, mm, ss=0):
+    return datetime(y, m, d, hh, mm, ss, tzinfo=ET)
 
 
 # --- market_state: behaviour must be unchanged by the refactor -------------
@@ -113,3 +113,25 @@ def test_naive_datetime_is_rejected():
     # silently land an evening SELL on the wrong settlement date. Fail loud.
     with pytest.raises(ValueError):
         next_trading_day_open(datetime(2026, 9, 18, 15, 55))
+
+
+# --- completed bars + minutes since open (2026-09-17) ------------------------
+
+def test_minutes_since_open():
+    from src.intraday_engine import minutes_since_open
+    assert minutes_since_open(et(2026, 9, 17, 9, 31)) == pytest.approx(1.0)
+    assert minutes_since_open(et(2026, 9, 17, 9, 0)) == pytest.approx(-30.0)
+    assert minutes_since_open(datetime(2026, 9, 17, 13, 46, tzinfo=timezone.utc)) == pytest.approx(16.0)
+
+
+def test_completed_bars_drops_only_a_forming_last_bar():
+    import pandas as pd
+    from src.intraday_engine import completed_bars
+    idx = pd.DatetimeIndex([pd.Timestamp(t, tz='America/New_York')
+                            for t in ('2026-09-17 09:25', '2026-09-17 09:30')])
+    h = pd.DataFrame({'close': [1.0, 2.0]}, index=idx)
+    # 09:31:34 ET: the 09:30 5m bar runs until 09:35 - still forming
+    assert list(completed_bars(h, now=et(2026, 9, 17, 9, 31, 34), interval='5m')['close']) == [1.0]
+    # 09:35:01 ET: it is finished
+    assert list(completed_bars(h, now=et(2026, 9, 17, 9, 35, 1), interval='5m')['close']) == [1.0, 2.0]
+    assert completed_bars(h.iloc[:0], now=et(2026, 9, 17, 9, 31, 34)).empty
