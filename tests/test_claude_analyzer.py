@@ -26,6 +26,7 @@ NOW = datetime(2026, 9, 17, 18, 0, tzinfo=timezone.utc)
     ("45 trades", "45 trades; 2 wins and 3 losses.", []),          # 0-3 ignored (ordinals)
     ("1,250 shares", "1250 shares", []),                            # comma-insensitive
     ("max drawdown 0.90%", "drawdown of 0.9%", []),                 # trailing zeros
+    ("net P&L -$8.29", "a loss of $8.29", []),                       # sign is phrasing
     ("", "The Fed cut rates by 25bps on 2026-09-16.", ['16', '2026', '25', '9']),   # an invented date is three unsourced numbers
 ])
 def test_unsourced_numbers(prompt, answer, bad):
@@ -77,6 +78,7 @@ def test_build_risk_context_states_the_rules():
            'unrealized': 0.0, 'stale': ['DOT-USD']}
     t = build_risk_context(pnl, max_positions=3, stop_loss_pct=0.007, take_profit_pct=0.012,
                            daily_loss_limit_pct=3)
+    assert '-$' not in t
     assert 'max 3 positions' in t and 'stop-loss 0.7%' in t and 'take-profit 1.2%' in t
     assert '3% daily loss' in t and 'stale): DOT-USD' in t
 

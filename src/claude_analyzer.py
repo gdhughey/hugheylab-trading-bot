@@ -55,12 +55,13 @@ def _numbers(text: str) -> set[str]:
     """Numeric tokens in `text`, normalised (no $ , % or trailing zeros)."""
     out = set()
     for tok in _NUM.findall(text or ''):
-        t = tok.strip('$%+').replace(',', '')
+        t = tok.replace('$', '').replace(',', '').rstrip('%').lstrip('+')
         try:
             v = float(t)
         except ValueError:
             continue
-        out.add(f"{v:g}")
+        # Magnitude only: "a loss of $8.29" is a fair reading of "$-8.29".
+        out.add(f"{abs(v):g}")
     return out
 
 
@@ -72,13 +73,15 @@ def unsourced_numbers(prompt: str, answer: str) -> list[str]:
     """
     have = _numbers(prompt)
     return sorted(n for n in _numbers(answer)
-                  if n not in have and not (n.lstrip('-').isdigit() and abs(int(n)) <= 3))
+                  if n not in have and not (n.isdigit() and int(n) <= 3))
 
 
 # --- context builders (Python computes, the model narrates) -------------------
 
 def _fmt_usd(x):
-    return f"${x:,.2f}" if x is not None else "n/a"
+    if x is None:
+        return "n/a"
+    return f"-${abs(x):,.2f}" if x < 0 else f"${x:,.2f}"
 
 
 def _pct(x, digits=1):
