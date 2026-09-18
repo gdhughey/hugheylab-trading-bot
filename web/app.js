@@ -71,7 +71,9 @@
     $('loss-flag').classList.toggle('hidden', !t.loss_tripped);
     $('review-flag').classList.toggle('hidden', !t.review_posted);
     if (s.equity_series && s.equity_series.length) {
-      const series = s.equity_series.slice();
+      // one point per date (day 0 is synthetic and shares the open date's row); uPlot needs ascending x
+      const byDate = new Map(); for (const p of s.equity_series) byDate.set(p.date, p);
+      const series = [...byDate.values()].sort((a, b) => a.date < b.date ? -1 : 1);
       // live point for today so the line ends at the current equity
       if (series[series.length - 1].date !== s.day_et) series.push({ date: s.day_et, equity: a.equity });
       else series[series.length - 1] = { date: s.day_et, equity: a.equity };
@@ -79,8 +81,8 @@
     }
 
     // header state
-    const st = f.state || 'closed';
-    const pill = $('market-state'); pill.textContent = (f.desc || st).toUpperCase(); pill.className = 'pill ' + st;
+    const st = f.state || (f.warming_up ? 'warming' : 'closed');
+    const pill = $('market-state'); pill.textContent = f.state ? (f.desc || st).toUpperCase() : (f.warming_up ? 'WARMING UP' : '—'); pill.className = 'pill ' + (f.state || '');
     lastCycleTs = f.ts ? new Date(f.ts) : null;
 
     // doing now
