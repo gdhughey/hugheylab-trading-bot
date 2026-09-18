@@ -341,8 +341,10 @@ Sell signals on stocks you do not own are filtered out — there is no short sid
 | `/scan [top]` | Rank the whole universe right now |
 | `/pnl` | The scorecard now: all-time P&L, verdicts, positions marked to market |
 | `/account` | Balance, cash, unsettled, buying power, starting cash, opened |
-| `/daily_brief` | Claude market commentary (optional) |
-| `/risk_check` | Claude risk read on open positions (optional) |
+| `/daily_brief` | The day in plain English, narrated by the local model from the bot's own numbers, positions, earnings dates and stored headlines |
+| `/risk_check` | Risk read on open positions against the bot's own stop/take-profit/size rules |
+| `/postmortem [date]` | What a day's losing trades had in common (entry timing, gap vs prior close, 1m path, headlines). Also posted automatically when the day's realised loss passes `REVIEW_LOSS_PCT` or `REVIEW_CONSECUTIVE_STOPS` stops fire in a row |
+| `/why SYMBOL` | The most recent trade in a name, explained: why it entered, what price did, which rule closed it |
 | `/retrain` | Refresh all sources and retrain (~4 min) |
 | `/fast` | Intraday model stats, exit rules, gates, and live scores |
 | `/summary` | The same scorecard the 16:05 ET report posts |
@@ -368,6 +370,48 @@ equity row) it labels the day's logged signals, records the day's equity, and
 posts the scorecard described under "Paper account". A failed post is retried
 every 5 minutes; `day_state.report_posted_at` guarantees at most one post per
 date, even across the nightly restart. `/summary` shows it on demand.
+
+### AI analyst
+
+`/daily_brief`, `/risk_check`, `/postmortem`, `/why` and the paragraph on the
+16:05 report are narrated by an LLM that **never computes**: Python builds a
+block of facts, the model writes prose about exactly that, and every reply is
+scanned for numbers that do not appear in its prompt (they are flagged, not
+hidden). `LLM_BASE_URL` points at any OpenAI-compatible server - here a
+llama.cpp Qwen3-8B on a local GPU box; ~3-5 s per answer, $0. `CLAUDE_API_KEY`
+is used only for the weekly review, falling back to the local model.
+
+### Live console and metrics
+
+The bot serves a read-only console on `WEB_PORT` (default 8090): equity line,
+positions with their barrier prices, what the fast loop is doing this cycle
+and why it skipped what it skipped, model precision vs breakeven, the last
+scan as a ticker tape, the ledger, data-feed health and the bot's own log -
+pushed over server-sent events every 5 s. `/metrics` on the same port is a
+Prometheus exposition of the same numbers; `proxmox/grafana-dashboard.py`
+builds the Grafana dashboard from it. LAN only, no auth.
+
+### Data collector
+
+`proxmox/trading-collector.timer` runs `src/collector.py` hourly in its own
+process: 1m bars for the fast universe, Finnhub company news (publication
+time in UTC), and the earnings calendar. Nothing trades on it yet; it exists
+because none of it can be downloaded retroactively for free.
+
+## Validating a config: `tune_optuna.py`
+
+`tune.py` is a grid scored on a 4-window walk-forward. `tune_optuna.py` is the
+honest successor: a TPE search where every trial is scored by Combinatorial
+Purged CV (C(6,2) = 15 purged splits from the bars already in the DB) and the
+best trial must clear a Deflated Sharpe bar - its t-statistic has to beat the
+expected maximum of N pure-noise trials - before the output says PASS.
+
+    OMP_NUM_THREADS=3 nice -n 19 venv/bin/python tune_optuna.py --asset stock --trials 100
+
+It writes `data/tuned_optuna.json` and never touches `data/tuned.json`: copy
+it over by hand only on a PASS. A 6-trial smoke run on 2026-09-18 returned
+EV -0.11%/trade with t = -28 against a bar of 9.85 - i.e. FAIL, which is the
+correct reading of this feature set so far.
 
 ## Retraining manually
 

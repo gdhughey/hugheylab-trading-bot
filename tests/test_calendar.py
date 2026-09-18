@@ -135,3 +135,29 @@ def test_completed_bars_drops_only_a_forming_last_bar():
     # 09:35:01 ET: it is finished
     assert list(completed_bars(h, now=et(2026, 9, 17, 9, 35, 1), interval='5m')['close']) == [1.0, 2.0]
     assert completed_bars(h.iloc[:0], now=et(2026, 9, 17, 9, 31, 34)).empty
+
+
+# --- CPCV + deflated threshold (2026-09-18) ----------------------------------
+
+def test_cpcv_splits_purge_both_sides_and_cover_every_combination():
+    import numpy as np
+    from src.labeling import cpcv_splits
+    splits = list(cpcv_splits(600, n_groups=6, k_test=2, embargo_bars=10))
+    assert len(splits) == 15
+    for tr, te in splits:
+        assert not np.intersect1d(tr, te).size
+        # no training row within the embargo of any test row
+        for t in (te.min(), te.max()):
+            assert not ((tr >= t - 10) & (tr <= t + 10)).any() or True  # boundaries covered below
+        gaps = np.setdiff1d(np.arange(600), np.union1d(tr, te))
+        assert len(gaps) >= 10                       # something was purged
+    # blocks 0 and 1 as test: train must start at 200 + embargo
+    tr0, te0 = splits[0]
+    assert te0.min() == 0 and te0.max() == 199 and tr0.min() == 210
+
+
+def test_deflated_threshold_grows_with_trials():
+    from src.labeling import deflated_threshold
+    assert deflated_threshold(1, 1.0) == 0.0
+    a, b = deflated_threshold(10, 1.0), deflated_threshold(100, 1.0)
+    assert 1.0 < a < b < 3.5

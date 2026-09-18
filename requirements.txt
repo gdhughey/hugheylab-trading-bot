@@ -7,3 +7,4 @@ numpy>=1.26.0
 scikit-learn>=1.5.0
 joblib>=1.4.0
 lxml>=5.0.0
+optuna>=4.0

@@ -124,3 +124,53 @@ def purged_split(X, y, test_size=0.2, embargo_bars=0):
     train_end = max(0, cut - embargo_bars)
     return (X.iloc[:train_end], X.iloc[cut:],
             y.iloc[:train_end], y.iloc[cut:])
+
+
+def cpcv_splits(n, n_groups=6, k_test=2, embargo_bars=0):
+    """Combinatorial Purged Cross-Validation (López de Prado, AFML ch. 12).
+
+    Cut the chronologically ordered rows into `n_groups` contiguous blocks and
+    yield every combination of `k_test` blocks as the test set, training on
+    the rest with `embargo_bars` rows purged on BOTH sides of each test block
+    (a label at row i reads rows i+1..i+horizon, so training rows just before
+    a test block have seen its first bars, and rows just after it were
+    labelled using its last bars).
+
+    C(6, 2) = 15 splits, each block tested in 5 different training contexts.
+    Against the 4-window walk-forward this gives a distribution of
+    out-of-sample results rather than one path, which is what the Deflated
+    Sharpe correction needs. Yields (train_idx, test_idx) as integer arrays.
+    """
+    import itertools
+    import numpy as np
+    bounds = np.linspace(0, n, n_groups + 1).astype(int)
+    blocks = [(bounds[i], bounds[i + 1]) for i in range(n_groups)]
+    for test_groups in itertools.combinations(range(n_groups), k_test):
+        mask = np.ones(n, dtype=bool)
+        test = np.zeros(n, dtype=bool)
+        for g in test_groups:
+            a, b = blocks[g]
+            test[a:b] = True
+            mask[max(0, a - embargo_bars):min(n, b + embargo_bars)] = False
+        train_idx = np.flatnonzero(mask)
+        test_idx = np.flatnonzero(test)
+        if len(train_idx) and len(test_idx):
+            yield train_idx, test_idx
+
+
+def deflated_threshold(n_trials, trial_var, skew=0.0, kurt=3.0):
+    """Expected maximum t-statistic among `n_trials` independent noise
+    trials (Bailey & López de Prado, "The Deflated Sharpe Ratio").
+
+    After trying N configurations, the best one's t-stat must beat roughly
+    E[max of N nulls] = sqrt(V) * ((1-g) * Z(1-1/N) + g * Z(1-1/(N e)))
+    before it is evidence of anything; V is the variance of the trials'
+    statistics and g Euler-Mascheroni. Returns that expected max (0 when N<2).
+    """
+    import math
+    from statistics import NormalDist
+    if n_trials < 2 or trial_var <= 0:
+        return 0.0
+    g = 0.5772156649
+    z = NormalDist().inv_cdf
+    return math.sqrt(trial_var) * ((1 - g) * z(1 - 1 / n_trials) + g * z(1 - 1 / (n_trials * math.e)))
