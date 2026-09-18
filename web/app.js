@@ -3,6 +3,12 @@
    except formatting and the bar/margin widths. */
 (() => {
   const $ = (id) => document.getElementById(id);
+  // Errors go on the page (bottom-right), not only to a console nobody is watching.
+  const errBox = document.createElement('pre'); errBox.id = 'errs'; errBox.style.cssText = 'position:fixed;right:8px;bottom:8px;max-width:48vw;max-height:30vh;overflow:auto;margin:0;padding:8px 10px;background:rgba(255,77,94,.12);border:1px solid #ff4d5e;color:#ff9aa4;font:11px/1.4 "IBM Plex Mono",monospace;z-index:99;display:none;white-space:pre-wrap';
+  document.body.appendChild(errBox);
+  const showErr = (m) => { errBox.style.display = 'block'; errBox.textContent += m + '\n'; };
+  addEventListener('error', (e) => showErr(`${e.message} @${(e.filename || '').split('/').pop()}:${e.lineno}`));
+  addEventListener('unhandledrejection', (e) => showErr(String(e.reason)));
   const ET = 'America/New_York';
   const fmtUsd = (v, sign = false) => v == null ? '—' :
     (sign && v > 0 ? '+' : v < 0 ? '−' : '') + '$' + Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -34,13 +40,14 @@
       scales: { x: { time: true }, y: { range: (u, min, max) => { const pad = Math.max((max - min) * 0.25, 2); return [min - pad, max + pad]; } } },
       axes: [
         { stroke: '#6b6a5e', grid: { stroke: '#1c2230', width: 1 }, ticks: { stroke: '#1c2230' }, font: '11px "IBM Plex Mono"',
+          incrs: [86400, 2 * 86400, 7 * 86400, 14 * 86400, 30 * 86400], space: 70,
           values: (u, ts) => ts.map(t => new Date(t * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })) },
         { stroke: '#6b6a5e', grid: { stroke: '#1c2230', width: 1 }, ticks: { stroke: '#1c2230' }, font: '11px "IBM Plex Mono"', size: 56,
           values: (u, vs) => vs.map(v => '$' + v.toFixed(0)) },
       ],
       series: [
         {},
-        { stroke: amber, width: 2, fill: (u) => { const g = u.ctx.createLinearGradient(0, 0, 0, u.bbox.height); g.addColorStop(0, 'rgba(255,176,0,.28)'); g.addColorStop(1, 'rgba(255,176,0,0)'); return g; }, points: { show: true, size: 6, fill: '#0e1116', stroke: amber } },
+        { stroke: amber, width: 2, fill: (u) => { const h = (u.bbox && isFinite(u.bbox.height) && u.bbox.height > 0) ? u.bbox.top + u.bbox.height : (u.height || 170); const g = u.ctx.createLinearGradient(0, 0, 0, h); g.addColorStop(0, 'rgba(255,176,0,.28)'); g.addColorStop(1, 'rgba(255,176,0,0)'); return g; }, points: { show: true, size: 6, fill: '#0e1116', stroke: amber } },
         { stroke: '#3a4358', width: 1, dash: [4, 4], points: { show: false } },
       ],
     };
@@ -77,7 +84,7 @@
       // live point for today so the line ends at the current equity
       if (series[series.length - 1].date !== s.day_et) series.push({ date: s.day_et, equity: a.equity });
       else series[series.length - 1] = { date: s.day_et, equity: a.equity };
-      try { if (window.uPlot) drawChart(series, a.starting_cash); } catch (e) { console.error('chart', e); }
+      try { if (!window.uPlot) showErr('uPlot not loaded'); else drawChart(series, a.starting_cash); } catch (e) { showErr('chart: ' + (e.stack || e)); }
     }
 
     // header state
