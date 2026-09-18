@@ -75,7 +75,7 @@
       // live point for today so the line ends at the current equity
       if (series[series.length - 1].date !== s.day_et) series.push({ date: s.day_et, equity: a.equity });
       else series[series.length - 1] = { date: s.day_et, equity: a.equity };
-      drawChart(series, a.starting_cash);
+      try { if (window.uPlot) drawChart(series, a.starting_cash); } catch (e) { console.error('chart', e); }
     }
 
     // header state
