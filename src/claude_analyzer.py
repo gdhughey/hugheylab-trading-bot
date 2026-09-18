@@ -23,10 +23,20 @@ today" with no data at all - it could only invent an answer.
 import os
 import re
 import json
+import time
 import logging
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
+
+
+def _stats(backend, ok, seconds, kind):
+    """Feed the live console's LLM counters; never let telemetry break a call."""
+    try:
+        from src.webapp import LLM
+        LLM.record(backend, ok, seconds, kind)
+    except Exception:
+        pass
 
 # Local (OpenAI-compatible) endpoint. Set LLM_BASE_URL to enable.
 LLM_BASE_URL = os.getenv('LLM_BASE_URL', '').rstrip('/')
@@ -295,7 +305,7 @@ class ClaudeAnalyzer:
             return "Claude declined to answer that request."
         return "\n".join(b.text for b in response.content if b.type == "text").strip()
 
-    async def _ask(self, user: str, prefer='local', max_tokens=400) -> str:
+    async def _ask(self, user: str, prefer='local', max_tokens=400, kind='ask') -> str:
         """Route a grounded prompt; flag any number the model invented."""
         if not self.enabled:
             return "AI analyst not configured (set LLM_BASE_URL or CLAUDE_API_KEY)."
@@ -306,9 +316,11 @@ class ClaudeAnalyzer:
                 continue
             if backend == 'claude' and not self.client:
                 continue
+            t0 = time.monotonic()
             try:
                 answer = (await self._ask_local(user, max_tokens) if backend == 'local'
                           else await self._ask_claude(user, max(max_tokens, 4000)))
+                _stats(backend, True, time.monotonic() - t0, kind)
                 bad = unsourced_numbers(user, answer)
                 if bad:
                     logger.warning(f"[{backend}] answer contains figures not in the facts: {bad}")
@@ -316,6 +328,7 @@ class ClaudeAnalyzer:
                 return answer
             except Exception as e:
                 last_err = e
+                _stats(backend, False, time.monotonic() - t0, kind)
                 logger.error(f"❌ {backend} LLM error: {e}")
         return f"AI analyst unavailable: {last_err}"
 
@@ -333,7 +346,7 @@ class ClaudeAnalyzer:
                   "what happened today, anything on the calendar or in the headlines for "
                   "names we hold, and what the bot's own verdicts say about whether it "
                   "should keep trading. Copy figures exactly as written in the facts.")
-        out = await self._ask(prompt, prefer='local', max_tokens=450)
+        out = await self._ask(prompt, prefer='local', max_tokens=450, kind='daily_brief')
         logger.info("✅ Daily brief generated")
         return out
 
@@ -346,7 +359,7 @@ class ClaudeAnalyzer:
                   "or one theme most of the book), position size relative to equity, "
                   "and what the bot's own rules will do about a move against us. "
                   "Copy figures exactly as written in the facts.")
-        out = await self._ask(prompt, prefer='local', max_tokens=400)
+        out = await self._ask(prompt, prefer='local', max_tokens=400, kind='risk_check')
         logger.info("✅ Risk assessment generated")
         return out
 
@@ -371,7 +384,7 @@ class ClaudeAnalyzer:
                   "repeatable mistake, and why. Finish with ONE specific question to "
                   "investigate - about the bot's rules, timing or data - not a trade "
                   "to place. Copy figures exactly as written in the facts.")
-        out = await self._ask(prompt, prefer='local', max_tokens=500)
+        out = await self._ask(prompt, prefer='local', max_tokens=500, kind='loss_review')
         logger.info("✅ Loss review generated")
         return out
 
@@ -383,7 +396,7 @@ class ClaudeAnalyzer:
                   "Write a weekly review of 4-6 sentences: what worked, what did not, "
                   "and one concrete thing to examine next week - phrased as a question "
                   "to investigate, not a trade to place.")
-        out = await self._ask(prompt, prefer='claude', max_tokens=800)
+        out = await self._ask(prompt, prefer='claude', max_tokens=800, kind='weekly_review')
         logger.info("✅ Weekly review generated")
         return out
 
@@ -398,4 +411,4 @@ class ClaudeAnalyzer:
                   "In one or two sentences, say what the headline is about and whether "
                   "it reads as positive, negative or neutral for the company. Do not "
                   "predict the price.")
-        return await self._ask(prompt, prefer='local', max_tokens=150)
+        return await self._ask(prompt, prefer='local', max_tokens=150, kind='news_impact')

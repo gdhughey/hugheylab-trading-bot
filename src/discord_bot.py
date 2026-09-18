@@ -15,6 +15,7 @@ import logging
 from src import costs, signal_log
 from src.claude_analyzer import ClaudeAnalyzer, build_brief_context, build_risk_context
 from src.postmortem import build_postmortem_context
+from src.webapp import WebApp
 from src.budget_tracker import BudgetTracker, _et_date
 from src.costs import qty_str
 from src.database import connect
@@ -78,6 +79,9 @@ class TradingBot(commands.Cog):
                                 quote_fn=lambda s: self.engine.latest_price(s))
                      if self.fast_mode else None)
         self._last_fast_summary = None
+        # Live console + /metrics (src/webapp.py). WEB_PORT=0 disables it.
+        self.web = WebApp(self) if int(os.getenv('WEB_PORT', 8090)) else None
+        self._web_started = False
 
         # Add cogs
         self.bot.add_listener(self.on_ready)
@@ -390,6 +394,12 @@ class TradingBot(commands.Cog):
 
     async def on_ready(self):
         """Bot startup event"""
+        if self.web and not self._web_started:
+            self._web_started = True
+            try:
+                await self.web.start()
+            except Exception as e:
+                logger.error(f"live console failed to start: {e}")
         logger.info(f"✅ Bot logged in as {self.bot.user}")
         logger.info("📝 PAPER TRADING MODE - no broker is connected; approvals "
                     "only write to the local ledger")
@@ -855,6 +865,10 @@ class TradingBot(commands.Cog):
         except Exception:
             logger.exception("fast cycle failed")
             return
+        if self.web:
+            if summary.get('rows') == 0 and not summary.get('bars_skipped') and summary.get('state') == 'open':
+                self.web.throttled_fetches += 1
+            self.web.notify()
         channel = await self._destination()
         if not channel:
             if summary['entries'] or summary['exits']:

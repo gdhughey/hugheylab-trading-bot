@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HUGHEYLAB · TAPE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/uPlot/1.6.31/uPlot.min.css">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-state="connecting">
+<div class="crt"></div>
+
+<header class="top">
+  <div class="brand">
+    <span class="brand-mark">▮▮</span>
+    <span class="brand-name">HUGHEYLAB <em>/</em> TAPE</span>
+    <span class="brand-sub">paper desk · no broker · no real money</span>
+  </div>
+  <div class="clock">
+    <span id="clock-et" class="clock-big">--:--:--</span>
+    <span class="clock-lbl">ET</span>
+    <span id="market-state" class="pill">—</span>
+  </div>
+  <div class="link" id="link">
+    <span class="dot"></span><span id="link-text">connecting</span>
+    <span class="sep">·</span><span id="cycle-age">cycle —</span>
+  </div>
+</header>
+
+<div class="tape" aria-label="latest signals">
+  <div class="tape-track" id="tape"><span class="tape-item dim">waiting for first scan…</span></div>
+</div>
+
+<main class="grid">
+
+  <!-- EQUITY HERO -->
+  <section class="card hero" style="--i:0">
+    <div class="hero-head">
+      <div>
+        <div class="lbl">EQUITY</div>
+        <div class="hero-num"><span id="equity">—</span></div>
+        <div class="hero-sub"><span id="alltime" class="signed">—</span> <span class="dim">since open · started <span id="starting">—</span></span></div>
+      </div>
+      <div class="hero-side">
+        <div class="kv"><span class="lbl">TODAY</span><span id="today-real" class="signed mono">—</span></div>
+        <div class="kv"><span class="lbl">UNREALISED</span><span id="unreal" class="signed mono">—</span></div>
+        <div class="kv"><span class="lbl">CASH / BP</span><span class="mono"><span id="cash">—</span> <span class="dim">/</span> <span id="bp">—</span></span></div>
+        <div class="kv"><span class="lbl">UNSETTLED</span><span id="unsettled" class="mono">—</span></div>
+      </div>
+    </div>
+    <div id="equity-chart" class="chart"></div>
+    <div class="hero-foot">
+      <span id="day-count" class="dim">—</span>
+      <span id="loss-flag" class="flag hidden">🛑 DAILY LOSS LIMIT · no new entries</span>
+      <span id="review-flag" class="flag hidden">🔎 loss review posted</span>
+    </div>
+  </section>
+
+  <!-- DOING NOW -->
+  <section class="card now" style="--i:1">
+    <div class="card-head"><h2>DOING NOW</h2><span id="now-ts" class="dim mono"></span></div>
+    <div class="now-state">
+      <div class="pulse" id="pulse"></div>
+      <div>
+        <div id="now-headline" class="now-h">—</div>
+        <div id="now-note" class="dim">—</div>
+      </div>
+    </div>
+    <dl class="now-facts">
+      <div><dt>bars</dt><dd id="now-rows">—</dd></div>
+      <div><dt>to close</dt><dd id="now-close">—</dd></div>
+      <div><dt>slots</dt><dd id="now-slots">—</dd></div>
+      <div><dt>poll</dt><dd id="now-poll">—</dd></div>
+    </dl>
+    <div class="lbl mt">SKIPPED THIS CYCLE</div>
+    <ul id="skipped" class="skipped"><li class="dim">—</li></ul>
+  </section>
+
+  <!-- POSITIONS -->
+  <section class="card positions" style="--i:2">
+    <div class="card-head"><h2>OPEN POSITIONS</h2><span id="pos-count" class="badge">0</span></div>
+    <table class="tbl" id="positions">
+      <thead><tr><th>SYM</th><th class="r">SHARES</th><th class="r">AVG</th><th class="r">NOW</th><th class="r">P&amp;L</th><th class="r">%</th><th>BARRIERS</th></tr></thead>
+      <tbody><tr><td colspan="7" class="empty">flat</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- MODELS -->
+  <section class="card models" style="--i:3">
+    <div class="card-head"><h2>MODELS</h2><span class="dim">precision vs breakeven</span></div>
+    <div id="models" class="model-list"></div>
+  </section>
+
+  <!-- SIGNALS -->
+  <section class="card signals" style="--i:4">
+    <div class="card-head"><h2>LAST SCAN</h2><span id="scan-ts" class="dim mono">—</span></div>
+    <table class="tbl" id="signals">
+      <thead><tr><th>SYM</th><th>CLASS</th><th class="r">P</th><th class="r">BAR</th><th>MARGIN</th><th class="r">REF</th></tr></thead>
+      <tbody><tr><td colspan="6" class="empty">no scan yet</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- TRADES -->
+  <section class="card trades" style="--i:5">
+    <div class="card-head"><h2>LEDGER</h2><span id="trade-stats" class="dim mono">—</span></div>
+    <table class="tbl" id="trades">
+      <thead><tr><th>ET</th><th>SIDE</th><th>SYM</th><th class="r">QTY</th><th class="r">FILL</th><th class="r">NET</th><th>WHY</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- DATA + AI -->
+  <section class="card health" style="--i:6">
+    <div class="card-head"><h2>DATA · AI</h2></div>
+    <div class="health-grid">
+      <div class="tile"><span class="lbl">5m BAR AGE</span><span id="age5" class="tile-num">—</span></div>
+      <div class="tile"><span class="lbl">1m BAR AGE</span><span id="age1" class="tile-num">—</span></div>
+      <div class="tile"><span class="lbl">UNIVERSE</span><span id="universe" class="tile-num">—</span></div>
+      <div class="tile"><span class="lbl">THROTTLED</span><span id="throttled" class="tile-num">—</span></div>
+      <div class="tile"><span class="lbl">HEADLINES 24h</span><span id="news24" class="tile-num">—</span></div>
+      <div class="tile"><span class="lbl">SIGNALS LOGGED</span><span id="sigcount" class="tile-num">—</span></div>
+      <div class="tile wide"><span class="lbl">ANALYST</span><span id="llm" class="tile-txt">—</span></div>
+      <div class="tile wide"><span class="lbl">LAST CALL</span><span id="llm-last" class="tile-txt">—</span></div>
+    </div>
+  </section>
+
+  <!-- LOG -->
+  <section class="card log" style="--i:7">
+    <div class="card-head"><h2>ACTIVITY</h2><span class="dim">bot log, newest first</span></div>
+    <ol id="log" class="loglist"></ol>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <span>uptime <span id="uptime" class="mono">—</span></span>
+  <span class="sep">·</span>
+  <span>/api/state · /api/events · /metrics</span>
+  <span class="sep">·</span>
+  <span class="dim">every figure on this page is the ledger's; nothing here is a recommendation</span>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/uPlot/1.6.31/uPlot.iife.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
