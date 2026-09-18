@@ -15,11 +15,12 @@ RestartSec=15
 # during which it stopped trading entirely but still looked "active" to systemd.
 # A hard cap makes that failure fast and loud (OOM -> restart) instead of a
 # silent multi-hour stall, and Restart=always covers a clean exit too.
-# Raised 700M -> 1200M in the container on 2026-09-16 (93-symbol universe +
-# per-class models sit at ~1.05 GB); committed 2026-09-17 so a deploy of this
-# file can't shrink the cap under a running bot. LXC 200 itself is 2 GB.
-MemoryMax=1200M
-MemoryHigh=1000M
+# 700M (09-07) -> 1200M (09-16) -> 3G (09-18). At 1200M the bot idled at
+# ~1.05 GB and was OOM-killed twice on 2026-09-18 (02:57 and 09:18, the
+# second while answering a slash command) - the cap was below the working
+# set, so it fired on normal use, not on a leak. LXC 200 is 4 GB / 6 cores.
+MemoryMax=3G
+MemoryHigh=2500M
 OOMPolicy=kill
 StandardOutput=journal
 StandardError=journal
