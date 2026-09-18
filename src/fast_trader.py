@@ -108,6 +108,7 @@ class FastTrader:
         self.cooldown = {}                # symbol -> datetime it may be re-entered
         self.entry_time = {}              # symbol -> when we opened it
         self.last_summary = {}
+        self._last_bar_bucket = None      # the bar boundary the last bar fetch covered
         self._recover_entry_times()
 
     def _recover_entry_times(self):
@@ -179,6 +180,17 @@ class FastTrader:
 
     # --- the cycle -------------------------------------------------------
 
+    def _bar_bucket(self, now):
+        """Identity of the newest bar that should be complete at `now`.
+
+        Bars start on INTERVAL boundaries; one is complete BAR_FETCH_GRACE_S
+        after its end. Before the grace has passed the previous bucket is
+        returned, so a fetch is not wasted on a bar Yahoo has not published.
+        """
+        step = _interval_minutes() * 60
+        grace = _cfg('BAR_FETCH_GRACE_S', 20)
+        return int((now.timestamp() - grace) // step)
+
     def cycle(self, now=None):
         """One pass. Returns a dict describing what happened (for reporting).
 
@@ -218,8 +230,23 @@ class FastTrader:
             self.last_summary = summary
             return summary
 
-        rows = self.engine.fetch()
-        summary['rows'] = rows
+        # Bars change once per INTERVAL, quotes change every second. Polling
+        # yf.download 93 symbols every 60 s was ~5,600 Yahoo requests/hour and
+        # 452 throttled ("possibly delisted") responses in a day; exits never
+        # needed it, they price off quote_fn. Fetch bars once per closed bar,
+        # BAR_FETCH_GRACE_S after the boundary so Yahoo has published it.
+        bucket = self._bar_bucket(now)
+        if bucket != self._last_bar_bucket:
+            rows = self.engine.fetch()
+            summary['rows'] = rows
+            if rows > 0 or self._last_bar_bucket is None:
+                self._last_bar_bucket = bucket
+            elif rows == 0:
+                logger.warning("[fast] bar refresh returned 0 rows - Yahoo throttled? "
+                               "will retry next cycle")
+        else:
+            summary['rows'] = 0
+            summary['bars_skipped'] = True
         to_close = minutes_to_close(now)
         summary['minutes_to_close'] = to_close
 

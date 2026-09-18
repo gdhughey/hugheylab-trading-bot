@@ -18,7 +18,7 @@ from src.postmortem import build_postmortem_context
 from src.budget_tracker import BudgetTracker, _et_date
 from src.costs import qty_str
 from src.database import connect
-from src.ml_engine import load_universe
+from src.ml_engine import load_universe, REFRESH_PERIOD
 from src.intraday_engine import (IntradayEngine, market_state,
                                  minutes_to_close, ET, is_crypto,
                                  asset_class, barriers, next_trading_day_open)
@@ -1015,7 +1015,7 @@ class TradingBot(commands.Cog):
         # the same frozen bars and emit identical signals forever. yfinance is
         # blocking, so keep it off the event loop.
         try:
-            await asyncio.to_thread(self.engine.fetch_and_store_data, symbols)
+            await asyncio.to_thread(self.engine.fetch_and_store_data, symbols, REFRESH_PERIOD)
         except Exception as e:
             logger.error(f"Price refresh failed, scoring stale data: {e}")
 

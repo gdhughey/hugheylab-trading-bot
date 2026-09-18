@@ -37,6 +37,7 @@ try:
 except Exception as _e:  # non-fatal - yfinance just runs uncached
     logger.debug(f"could not set yfinance cache location: {_e}")
 LOOKBACK = os.getenv('LOOKBACK_PERIOD', '2y')
+REFRESH_PERIOD = os.getenv('REFRESH_PERIOD', '10d')   # hourly top-up window
 
 # Which question the classifier is trained to answer.
 #   next_day   - does tomorrow close higher than today? (direction, ~coin-flip)
@@ -170,13 +171,20 @@ class TradingSignalEngine:
 
     # --- data ------------------------------------------------------------
 
-    def fetch_and_store_data(self, symbols=None) -> int:
+    def fetch_and_store_data(self, symbols=None, period=None) -> int:
         """Fill price history from the provider chain.
 
         Each provider only sees the symbols still missing after the previous
         one, so a rate-limited source is spent on genuine gaps rather than on
         symbols that already resolved.
+
+        `period` defaults to LOOKBACK (2y). The hourly loop passes
+        REFRESH_PERIOD ('10d') instead: re-downloading two years of 503 names
+        every hour was 146 of the 602 Yahoo "possibly delisted" (throttled)
+        responses seen on 2026-09-18, and the store is an upsert, so a short
+        window keeps it current at a fraction of the requests.
         """
+        period = period or LOOKBACK
         self.symbols = list(symbols) if symbols else (self.symbols or load_universe())
         # Benchmarks ride along in the same provider batches (one extra name
         # per request) but never enter self.symbols, so training and scanning
@@ -194,7 +202,7 @@ class TradingSignalEngine:
             cap = provider.per_cycle_cap
             attempt = pending[:cap] if cap else pending
             try:
-                frames, missing = provider.fetch(attempt, LOOKBACK)
+                frames, missing = provider.fetch(attempt, period)
             except Exception as e:
                 logger.error(f"[{provider.name}] fetch failed: {e}")
                 continue

@@ -605,3 +605,25 @@ def test_loss_review_due_on_realised_loss_pct(tmp_path, monkeypatch):
     s = trader.cycle(now=NOW + timedelta(minutes=5))
     assert s['exits'] and s['review_due'] is True
     assert s['review_reason'].startswith('realised -') and '1% of the $500.00 start' in s['review_reason']
+
+
+def test_bars_fetched_once_per_closed_bar_not_every_cycle(tmp_path, monkeypatch):
+    budget = make_budget(tmp_path, monkeypatch)
+    engine = FakeEngine(['AAPL'], {'AAPL': 100.0})
+    calls = []
+    engine.fetch = lambda *a, **k: calls.append(1) or 93
+    trader = make_trader(engine, budget)
+
+    t0 = datetime(2026, 9, 14, 14, 30, 30, tzinfo=timezone.utc)      # 10:30:30 ET, 30 s past a 5m boundary
+    s = trader.cycle(now=t0); assert s['rows'] == 93 and len(calls) == 1
+    s = trader.cycle(now=t0 + timedelta(seconds=60))                 # same bar: no fetch
+    assert s['rows'] == 0 and s.get('bars_skipped') and len(calls) == 1
+    s = trader.cycle(now=t0 + timedelta(minutes=4, seconds=45))      # 10:35:15: new bar but inside the 20 s grace
+    assert len(calls) == 1
+    s = trader.cycle(now=t0 + timedelta(minutes=5))                  # 10:35:30: grace passed, fetch
+    assert s['rows'] == 93 and len(calls) == 2
+
+    # A throttled (0-row) refresh is retried next cycle instead of waiting 5 min.
+    engine.fetch = lambda *a, **k: calls.append(1) or 0
+    trader.cycle(now=t0 + timedelta(minutes=10)); assert len(calls) == 3
+    trader.cycle(now=t0 + timedelta(minutes=10, seconds=60)); assert len(calls) == 4
