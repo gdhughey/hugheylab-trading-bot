@@ -247,8 +247,9 @@ def build_trade_context(conn, budget, symbol: str, now=None) -> str:
         try:
             heads = conn.execute(
                 "SELECT published_at, headline FROM news WHERE symbol = ? AND published_at <= ? "
-                "ORDER BY published_at DESC LIMIT 4",
-                (symbol, e_at.astimezone(timezone.utc).isoformat(timespec='seconds'))).fetchall()
+                "AND published_at >= ? ORDER BY published_at DESC LIMIT 4",
+                (symbol, e_at.astimezone(timezone.utc).isoformat(timespec='seconds'),
+                 (e_at - timedelta(hours=24)).astimezone(timezone.utc).isoformat(timespec='seconds'))).fetchall()
             for p, h in heads:
                 lines.append(f"- {h} ({p[:16]}Z)")
         except Exception:
