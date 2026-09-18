@@ -388,6 +388,23 @@ class ClaudeAnalyzer:
         logger.info("✅ Loss review generated")
         return out
 
+    async def explain_trade(self, context: str):
+        """/why SYMBOL: what happened in one trade, from postmortem.build_trade_context()."""
+        if not context or context.startswith('No trades in'):
+            return context or "Nothing to explain."
+        prompt = (f"FACTS:\n{context}\n\n"
+                  "How to read the facts: 'entry was +X% vs yesterday' means the stock had "
+                  "already gapped up before the bot bought. 'model p' is the model's "
+                  "probability; the 'bar' is the minimum it needed. The exit reason is the "
+                  "bot's rule that fired (sl stop-loss, tp take-profit, eod end of day, "
+                  "timeout max hold).\n\n"
+                  "In 3-4 sentences tell the trader what happened in this trade and why the "
+                  "bot did what it did, in order: why it entered, what the price did, which "
+                  "rule closed it. Copy figures exactly as written in the facts.")
+        out = await self._ask(prompt, prefer='local', max_tokens=350, kind='why')
+        logger.info("✅ Trade explanation generated")
+        return out
+
     async def weekly_portfolio_review(self, trades, positions, performance):
         """The one call worth Claude: multi-step review. Falls back to local."""
         facts = (f"Trades this week:\n{json.dumps(trades, indent=1, default=str)}\n\n"

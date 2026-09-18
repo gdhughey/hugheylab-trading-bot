@@ -188,3 +188,10 @@ def test_loss_review_with_no_trades_never_calls_the_model(local, monkeypatch):
     monkeypatch.setattr(local, '_ask_local', boom)
     out = asyncio.run(local.loss_review("Loss review for 2026-09-17 (ET).\nNo trades on this date."))
     assert out == "No trades on this date - nothing to review."
+
+
+def test_explain_trade_passes_through_no_trades(local, monkeypatch):
+    async def boom(*a, **k):
+        raise AssertionError('model must not be called')
+    monkeypatch.setattr(local, '_ask_local', boom)
+    assert asyncio.run(local.explain_trade('No trades in ZZZ since the account opened.')) == 'No trades in ZZZ since the account opened.'

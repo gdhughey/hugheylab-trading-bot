@@ -194,3 +194,63 @@ def _counts(items):
     for x in items:
         out[x or 'n/a'] = out.get(x or 'n/a', 0) + 1
     return out
+
+
+def build_trade_context(conn, budget, symbol: str, now=None) -> str:
+    """Facts for `/why SYMBOL`: the most recent round trip (or open position)
+    in that name, with the same forensics as the day review - plus the
+    signal log's view of what the model was saying around entry."""
+    now = now or datetime.now(timezone.utc)
+    symbol = symbol.upper()
+    rows = [r for r in budget.get_trades_since_open() if r['symbol'] == symbol]
+    trades = pair_trades(rows)
+    if not trades:
+        return f"No trades in {symbol} since the account opened."
+    t = trades[-1]
+    e_at = t['entry_at']
+    day_et = (e_at or t['exit_at']).strftime('%Y-%m-%d')
+    lines = [f"Most recent {symbol} trade ({day_et} ET)."]
+    if e_at:
+        since_open = (e_at - e_at.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+        lines.append(f"Entered {e_at.strftime('%H:%M:%S')} ET ({since_open:+.0f} min from the open) at {_usd(t['entry_px'])}"
+                     + (f", model p={t['entry_p']:.3f}" if t['entry_p'] is not None else "") + ".")
+        pc = prior_close(conn, symbol, day_et)
+        if pc and t['entry_px']:
+            lines.append(f"Prior session close {_usd(pc)}: entry was {(t['entry_px'] / pc - 1) * 100:+.1f}% vs yesterday.")
+    if t['open']:
+        lines.append("Still open.")
+    else:
+        lines.append(f"Exited {t['exit_at'].strftime('%H:%M:%S')} ET at {_usd(t['exit_px'])} ({t['exit_reason'] or 'n/a'})"
+                     + (f" after {t['held_min']:.0f} min" if t['held_min'] is not None else "")
+                     + f", net {_usd(t['pnl'])}" + (f" ({t['pct'] * 100:+.2f}%)" if t['pct'] is not None else "") + ".")
+        if e_at:
+            path = price_path(conn, symbol, e_at.replace(second=0, microsecond=0) - timedelta(minutes=1), t['exit_at'])
+            if path:
+                lo, hi, last = path
+                lines.append(f"1m bars while held: low {_usd(lo)}, high {_usd(hi)}, last {_usd(last)}.")
+    if e_at:
+        # what the model thought in the hour around entry (the signal log records every scored bar)
+        try:
+            sig = conn.execute(
+                "SELECT bar_ts, probability, bar, above_bar, label FROM signals WHERE symbol = ? "
+                "AND bar_ts BETWEEN ? AND ? ORDER BY bar_ts",
+                (symbol, (e_at - timedelta(minutes=60)).astimezone(timezone.utc).isoformat(),
+                 (e_at + timedelta(minutes=60)).astimezone(timezone.utc).isoformat())).fetchall()
+            if sig:
+                above = sum(1 for r in sig if r[2] is not None and r[1] >= r[2])
+                lines.append(f"Model probability on the {len(sig)} bars within an hour of entry: "
+                             f"min {min(r[1] for r in sig):.3f}, max {max(r[1] for r in sig):.3f}, "
+                             f"{above} of them over the {sig[0][2]:.3f} bar.")
+        except Exception:
+            pass
+        lines.append(f"Headlines in the 24h before entry: {headline_count(conn, symbol, e_at)}.")
+        try:
+            heads = conn.execute(
+                "SELECT published_at, headline FROM news WHERE symbol = ? AND published_at <= ? "
+                "ORDER BY published_at DESC LIMIT 4",
+                (symbol, e_at.astimezone(timezone.utc).isoformat(timespec='seconds'))).fetchall()
+            for p, h in heads:
+                lines.append(f"- {h} ({p[:16]}Z)")
+        except Exception:
+            pass
+    return "\n".join(lines)

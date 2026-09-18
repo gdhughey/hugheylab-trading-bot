@@ -14,7 +14,7 @@ from datetime import datetime, timezone, time as dtime
 import logging
 from src import costs, signal_log
 from src.claude_analyzer import ClaudeAnalyzer, build_brief_context, build_risk_context
-from src.postmortem import build_postmortem_context
+from src.postmortem import build_postmortem_context, build_trade_context
 from src.webapp import WebApp
 from src.budget_tracker import BudgetTracker, _et_date
 from src.costs import qty_str
@@ -254,6 +254,17 @@ class TradingBot(commands.Cog):
                 logger.exception("/postmortem failed")
                 embed = discord.Embed(title="/postmortem failed", description=str(e),
                                       color=discord.Color.red())
+            await interaction.followup.send(embed=embed)
+
+        @tree.command(name='why', description="Why did the bot trade a symbol? Its most recent trade, explained")
+        @app_commands.describe(symbol='Ticker, e.g. NVDA or BTC-USD')
+        async def _why(interaction: discord.Interaction, symbol: str):
+            await interaction.response.defer(thinking=True)
+            try:
+                embed = self._warming_embed() or await self._embed_why(symbol)
+            except Exception as e:
+                logger.exception("/why failed")
+                embed = discord.Embed(title="/why failed", description=str(e), color=discord.Color.red())
             await interaction.followup.send(embed=embed)
 
         @tree.command(name='retrain',
@@ -695,6 +706,12 @@ class TradingBot(commands.Cog):
             return False
         try:
             embed = await asyncio.to_thread(self._scorecard_embed, day_et, now)
+            # A plain-English paragraph on top of the numbers, from the local
+            # analyst. Bounded and optional: the report must go out on time
+            # even if the GPU box is down.
+            prose = await self._plain_english(day_et, now)
+            if prose:
+                embed.add_field(name="In plain English", value=_clip_lines([prose])[:1024], inline=False)
             await channel.send(embed=embed)
         except discord.HTTPException as exc:
             # Discord refused the embed itself (too long, bad field). A one-liner
@@ -707,6 +724,24 @@ class TradingBot(commands.Cog):
         bt.set_day_flag(day_et, 'report_posted_at')
         logger.info(f"Posted daily report for {day_et}")
         return True
+
+    async def _plain_english(self, day_et: str, now=None, timeout_s=None) -> str | None:
+        """Grounded narration of the day for the 16:05 report. None on any
+        failure or timeout - never let the analyst delay the numbers."""
+        if not self.claude.enabled:
+            return None
+        timeout_s = timeout_s or float(os.getenv('REPORT_PROSE_TIMEOUT_S', 75))
+        try:
+            context = await asyncio.to_thread(
+                build_brief_context, self.budget_tracker, self.engine, self.intraday,
+                day_et, self.db.conn, now)
+            text = await asyncio.wait_for(self.claude.daily_market_analysis(context), timeout_s)
+            if not text or text.startswith('AI analyst unavailable'):
+                return None
+            return text
+        except Exception as e:
+            logger.warning(f"daily report prose skipped: {e}")
+            return None
 
     def _scorecard_embed(self, day_et: str, now=None) -> discord.Embed:
         """Render build_scorecard() for one ET date. Shared by the 16:05
@@ -1367,6 +1402,16 @@ class TradingBot(commands.Cog):
             e.add_field(name="Why now", value=reason, inline=False)
         e.set_footer(text=f"Narrated by {self.claude.backend_name} from the ledger and stored bars · "
                           "this changes nothing the bot does")
+        return e
+
+    async def _embed_why(self, symbol: str):
+        symbol = symbol.strip().upper()[:12]
+        context = await asyncio.to_thread(build_trade_context, self.db.conn, self.budget_tracker, symbol)
+        text = await self.claude.explain_trade(context)
+        e = discord.Embed(title=f"❓ Why {symbol}", description=text, color=discord.Color.dark_teal(),
+                          timestamp=datetime.now().astimezone())
+        e.add_field(name="The facts it was given", value=_clip_lines(context.splitlines())[:1024], inline=False)
+        e.set_footer(text=f"Narrated by {self.claude.backend_name} from the ledger, stored bars and headlines")
         return e
 
     async def _embed_account(self):

@@ -86,3 +86,22 @@ def test_context_with_no_trades(ledger):
     db, bt = ledger
     ctx = build_postmortem_context(db.conn, bt, DAY, now=NOW)
     assert 'No trades on this date.' in ctx and 'Patterns' not in ctx
+
+
+def test_trade_context_for_one_symbol(ledger):
+    from src.postmortem import build_trade_context
+    db, bt = ledger
+    a = bt.log_trade('CVNA', 'BUY', 67.53, 1.8416, probability=0.525, now=T_BUY); bt.execute_trade(a, now=T_BUY)
+    c = bt.log_trade('CVNA', 'SELL', 66.26, 1.8416, exit_reason='sl', now=T_SELL); bt.execute_trade(c, now=T_SELL)
+    with db.conn:
+        db.conn.execute("INSERT INTO signals (bar_ts,symbol,asset_class,probability,bar,above_bar,ref_price,trade_date) "
+                        "VALUES ('2026-09-17T13:30:00+00:00','CVNA','stock',0.525,0.347,1,67.5,'2026-09-17')")
+        db.conn.execute("INSERT INTO news (id,symbol,published_at,fetched_at,headline) VALUES "
+                        "(9,'CVNA','2026-09-16T22:00:00+00:00','x','Why Carvana dipped')")
+    ctx = build_trade_context(db.conn, bt, 'cvna', now=NOW)
+    assert ctx.startswith('Most recent CVNA trade (2026-09-17 ET).')
+    assert 'Entered 09:31:34 ET (+2 min from the open) at $67.53, model p=0.525.' in ctx
+    assert 'Exited 09:32:34 ET at $66.26 (sl) after 1 min, net' in ctx
+    assert 'Model probability on the 1 bars within an hour of entry: min 0.525, max 0.525, 1 of them over the 0.347 bar.' in ctx
+    assert 'Headlines in the 24h before entry: 1.' in ctx and '- Why Carvana dipped' in ctx
+    assert build_trade_context(db.conn, bt, 'ZZZ', now=NOW) == 'No trades in ZZZ since the account opened.'
