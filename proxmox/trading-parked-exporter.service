@@ -1,0 +1,29 @@
+[Unit]
+Description=Trading bot PARKED read-only metrics (:8090) - stand-in for the bot's console while trading-bot.service is off
+After=network-online.target
+Wants=network-online.target
+Conflicts=trading-bot.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading-bot
+EnvironmentFile=/opt/trading-bot/.env
+ExecStart=/opt/trading-bot/venv/bin/python -m src.parked_exporter
+Restart=always
+RestartSec=15
+MemoryMax=300M
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-parked-exporter
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# data/ must be writable only for SQLite's WAL -shm index; the exporter itself only SELECTs
+ReadWritePaths=/opt/trading-bot/data
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
